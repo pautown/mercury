@@ -38,7 +38,7 @@ GOOS=linux GOARCH=arm GOARM=7 go build -o bin/mediadash-client ./cmd/mediadash-c
 ```
 
 ### Deployment
-CarThing device: IP `172.16.42.2`, user `root`, password `nocturne`
+CarThing device: IP `172.16.42.2`, user `root`, password `llizardOS`
 
 ## Architecture
 
@@ -146,6 +146,6 @@ Failed commands are queued with exponential backoff (2s, 4s, 6s) up to 3 attempt
 
 Redis must be running on the CarThing for the client to function:
 ```bash
-sshpass -p nocturne ssh root@172.16.42.2 "sv start redis"
-sshpass -p nocturne ssh root@172.16.42.2 "redis-cli ping"
+sshpass -p llizardOS ssh root@172.16.42.2 "sv start redis"
+sshpass -p llizardOS ssh root@172.16.42.2 "redis-cli ping"
 ```

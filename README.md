@@ -1,11 +1,11 @@
-# MediaDash Go BLE Client
+# Mercury
 
-An always-on daemon that bridges the Android MediaDash phone companion app and the llizard CarThing UI over Bluetooth Low Energy. It uses Redis as the contract between BLE and the UI—connection health, media metadata, album art, podcast data, and user commands all flow through Redis keys.
+An always-on daemon that bridges the Android Mercury phone companion app and the llizard CarThing UI over Bluetooth Low Energy. It uses Redis as the contract between BLE and the UI—connection health, media metadata, album art, podcast data, and user commands all flow through Redis keys.
 
 ## Overview
 
-The MediaDash Go BLE Client acts as a bridge between:
-- **Android Phone** (MediaDash app) - Sends media state, album art, and podcast data via BLE
+Mercury acts as a bridge between:
+- **Android Phone** (Mercury app) - Sends media state, album art, and podcast data via BLE
 - **CarThing UI** (llizardgui-host) - Reads state from Redis and sends commands
 
 All data flows through Redis, providing a clean separation between the BLE complexity and the UI layer.
@@ -44,7 +44,7 @@ GOOS=linux GOARCH=arm GOARM=7 go build -o bin/mediadash-client ./cmd/mediadash-c
 ┌─────────────────┐                 ┌──────────────┐                 ┌─────────────────┐
 │                 │  BLE (Notify)   │              │   Redis Keys    │                 │
 │  Android Phone  │ ───────────────>│  Go Client   │ ───────────────>│  CarThing UI    │
-│  (MediaDash)    │                 │              │                 │  (llizardgui)   │
+│    (Mercury)    │                 │              │                 │  (llizardgui)   │
 │                 │<────────────────│              │<────────────────│                 │
 └─────────────────┘  BLE (Write)    └──────────────┘  Redis Queue    └─────────────────┘
                     (Commands)                        (Commands)
@@ -75,7 +75,7 @@ Entry point that:
 
 #### `internal/ble`
 Core BLE client (`client.go`):
-- **Device scanning** with MediaDash service UUID filtering
+- **Device scanning** with Mercury service UUID filtering
 - **Characteristic subscriptions** for media state, album art, and podcast data
 - **Rate-limited writes** (15ms intervals) to prevent ATT error 0x0e
 - **Connection health monitoring** with activity-based checks
@@ -405,7 +405,7 @@ Configuration is embedded in the binary via `//go:embed` in `internal/config/con
 ### CarThing Device Access
 - **IP:** `172.16.42.2`
 - **User:** `root`
-- **Password:** `nocturne`
+- **Password:** `llizardOS`
 
 ### Manual Deployment
 ```bash
@@ -438,13 +438,13 @@ Redis must be running for the client to function:
 
 ```bash
 # Start Redis service
-sshpass -p nocturne ssh root@172.16.42.2 "sv start redis"
+sshpass -p llizardOS ssh root@172.16.42.2 "sv start redis"
 
 # Check Redis status
-sshpass -p nocturne ssh root@172.16.42.2 "sv status redis"
+sshpass -p llizardOS ssh root@172.16.42.2 "sv status redis"
 
 # Test Redis connection
-sshpass -p nocturne ssh root@172.16.42.2 "redis-cli ping"
+sshpass -p llizardOS ssh root@172.16.42.2 "redis-cli ping"
 ```
 
 ### Running as a Service
@@ -522,9 +522,9 @@ redis-cli GET system:ble_name
 ## Troubleshooting
 
 ### Client won't connect to phone
-1. Ensure Android MediaDash app is running and BLE is enabled
+1. Ensure Android Mercury app is running and BLE is enabled
 2. Check that CarThing Bluetooth adapter is working: `hciconfig`
-3. Verify the MediaDash service UUID matches between Android and client
+3. Verify the Mercury service UUID matches between Android and client
 4. Check client logs for scanning/pairing errors
 
 ### Commands not reaching phone
