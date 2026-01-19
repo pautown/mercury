@@ -1,0 +1,16 @@
+# Compiled binaries (root binary only, not cmd/ directory)
+/mediadash-client
+/bin/
+
+# Windows Zone.Identifier files (WSL artifacts)
+*Zone.Identifier
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

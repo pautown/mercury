@@ -1,0 +1,64 @@
+{
+  "ble": {
+    "serviceUUID": "0000a0d0-0000-1000-8000-00805f9b34fb",
+    "mediaStateCharacteristicUUID": "0000a0d1-0000-1000-8000-00805f9b34fb",
+    "playbackControlCharacteristicUUID": "0000a0d2-0000-1000-8000-00805f9b34fb",
+    "albumArtRequestCharacteristicUUID": "0000a0d3-0000-1000-8000-00805f9b34fb",
+    "albumArtDataCharacteristicUUID": "0000a0d4-0000-1000-8000-00805f9b34fb",
+    "podcastInfoCharacteristicUUID": "0000a0d5-0000-1000-8000-00805f9b34fb",
+    "lyricsRequestCharacteristicUUID": "0000a0d6-0000-1000-8000-00805f9b34fb",
+    "lyricsDataCharacteristicUUID": "0000a0d7-0000-1000-8000-00805f9b34fb",
+    "settingsCharacteristicUUID": "0000a0d8-0000-1000-8000-00805f9b34fb",
+    "rateLimiting": {
+      "writeIntervalMs": 15,
+      "description": "Minimum interval between BLE writes to prevent ATT error 0x0e. 15ms provides safety margin for Android BLE stack variability and battery optimization delays."
+    },
+    "connectionMonitoring": {
+      "healthCheckIntervalMinutes": 1,
+      "activityTimeoutMinutes": 1,
+      "description": "Only perform connection health checks if no activity for specified timeout"
+    }
+  },
+  "redis": {
+    "address": "127.0.0.1:6379",
+    "keyMap": {
+      "trackTitle": "media:track",
+      "artistName": "media:artist",
+      "albumName": "media:album",
+      "isPlaying": "media:playing",
+      "durationMs": "media:duration",
+      "progressMs": "media:progress",
+      "albumArtPath": "media:art_path",
+      "bleConnected": "system:ble_connected",
+      "bleName": "system:ble_name",
+      "playbackCommandQueue": "system:playback_cmd_q",
+      "albumArtRequest": "mediadash:albumart:request",
+      "albumArtCache": "mediadash:albumart:cache",
+      "podcastRequestQueue": "podcast:request_q",
+      "podcastShowName": "podcast:show_name",
+      "podcastEpisodeTitle": "podcast:episode_title",
+      "podcastEpisodeDescription": "podcast:episode_description",
+      "podcastAuthor": "podcast:author",
+      "podcastEpisodeCount": "podcast:episode_count",
+      "podcastCurrentIndex": "podcast:current_index",
+      "podcastEpisodeList": "podcast:episode_list",
+      "podcastArtPath": "podcast:art_path",
+      "lyricsData": "lyrics:data",
+      "lyricsHash": "lyrics:hash",
+      "lyricsSynced": "lyrics:synced",
+      "lyricsEnabled": "lyrics:enabled"
+    }
+  },
+  "albumArt": {
+    "cacheDirectory": "/var/mediadash/album_art_cache",
+    "image": {
+      "format": "jpg",
+      "maxWidth": 200,
+      "maxHeight": 200,
+      "quality": 75
+    },
+    "ble": {
+      "chunkSize": 300
+    }
+  }
+}
