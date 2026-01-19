@@ -405,7 +405,7 @@ Configuration is embedded in the binary via `//go:embed` in `internal/config/con
 ### CarThing Device Access
 - **IP:** `172.16.42.2`
 - **User:** `root`
-- **Password:** `llizardOS`
+- **Password:** `llizardos`
 
 ### Manual Deployment
 ```bash
@@ -438,13 +438,13 @@ Redis must be running for the client to function:
 
 ```bash
 # Start Redis service
-sshpass -p llizardOS ssh root@172.16.42.2 "sv start redis"
+sshpass -p llizardos ssh root@172.16.42.2 "sv start redis"
 
 # Check Redis status
-sshpass -p llizardOS ssh root@172.16.42.2 "sv status redis"
+sshpass -p llizardos ssh root@172.16.42.2 "sv status redis"
 
 # Test Redis connection
-sshpass -p llizardOS ssh root@172.16.42.2 "redis-cli ping"
+sshpass -p llizardos ssh root@172.16.42.2 "redis-cli ping"
 ```
 
 ### Running as a Service
