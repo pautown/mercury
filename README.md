@@ -449,7 +449,7 @@ sshpass -p llizardos ssh root@172.16.42.2 "redis-cli ping"
 
 ### Running as a Service
 
-The client can be configured to run as a runit service on the CarThing for automatic startup.
+Mercury is configured to run as a runit service on llizardOS for automatic startup.
 
 ## Key Implementation Patterns
 
