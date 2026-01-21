@@ -9,6 +9,7 @@
     "lyricsRequestCharacteristicUUID": "0000a0d6-0000-1000-8000-00805f9b34fb",
     "lyricsDataCharacteristicUUID": "0000a0d7-0000-1000-8000-00805f9b34fb",
     "settingsCharacteristicUUID": "0000a0d8-0000-1000-8000-00805f9b34fb",
+    "timeSyncCharacteristicUUID": "0000a0d9-0000-1000-8000-00805f9b34fb",
     "rateLimiting": {
       "writeIntervalMs": 15,
       "description": "Minimum interval between BLE writes to prevent ATT error 0x0e. 15ms provides safety margin for Android BLE stack variability and battery optimization delays."

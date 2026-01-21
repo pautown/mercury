@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1072,6 +1074,7 @@ func (c *Client) setupCharacteristics() error {
 		"lyricsRequest":   c.cfg.Ble.LyricsRequestCharacteristicUUID,
 		"lyricsData":      c.cfg.Ble.LyricsDataCharacteristicUUID,
 		"settings":        c.cfg.Ble.SettingsCharacteristicUUID,
+		"timeSync":        c.cfg.Ble.TimeSyncCharacteristicUUID,
 	}
 
 	// Parse UUIDs and discover characteristics
@@ -1185,6 +1188,17 @@ func (c *Client) setupCharacteristics() error {
 		log.Println("✓ Settings notifications enabled")
 	} else {
 		log.Printf("Settings characteristic not available - settings sync disabled")
+	}
+
+	// Enable notifications for time sync (optional)
+	if c.characteristics["timeSync"] != nil {
+		log.Println("Enabling notifications for time sync characteristic...")
+		if err := c.characteristics["timeSync"].EnableNotifications(c.handleTimeSyncNotification); err != nil {
+			return fmt.Errorf("failed to enable time sync notifications: %w", err)
+		}
+		log.Println("✓ Time sync notifications enabled")
+	} else {
+		log.Printf("Time sync characteristic not available - time sync disabled")
 	}
 
 	return nil
@@ -1773,6 +1787,42 @@ func (c *Client) handleSettingsNotification(buf []byte) {
 			debug.LogLyrics("Successfully updated lyrics enabled to: %v", enabled)
 		}
 	}
+}
+
+// handleTimeSyncNotification processes time sync updates from Android
+// Sets the system time based on Unix timestamp received from the phone
+func (c *Client) handleTimeSyncNotification(buf []byte) {
+	// Update receive activity tracking
+	c.updateReceiveActivity()
+
+	if len(buf) < 5 {
+		log.Printf("[TIME_SYNC] Data too short: %d bytes", len(buf))
+		return
+	}
+
+	// Parse Unix timestamp (decimal string)
+	timestampStr := strings.TrimSpace(string(buf))
+	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+	if err != nil {
+		log.Printf("[TIME_SYNC] Failed to parse timestamp '%s': %v", timestampStr, err)
+		return
+	}
+
+	// Convert to time.Time for logging
+	syncTime := time.Unix(timestamp, 0)
+	log.Printf("[TIME_SYNC] Received time from Android: %s (Unix: %d)", syncTime.Format(time.RFC3339), timestamp)
+
+	// Set system time using the date command
+	// Format: date -s "@<timestamp>" sets time from Unix timestamp
+	cmd := fmt.Sprintf("date -s \"@%d\"", timestamp)
+	output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		log.Printf("[TIME_SYNC] Failed to set system time: %v (output: %s)", err, string(output))
+		c.trackError("time_sync_set", err)
+		return
+	}
+
+	log.Printf("[TIME_SYNC] ✓ System time synchronized to: %s", syncTime.Format("2006-01-02 15:04:05 MST"))
 }
 
 // requestLyrics requests lyrics from the Android server

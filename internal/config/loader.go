@@ -21,6 +21,7 @@ type Config struct {
 		LyricsRequestCharacteristicUUID   string `json:"lyricsRequestCharacteristicUUID"`
 		LyricsDataCharacteristicUUID      string `json:"lyricsDataCharacteristicUUID"`
 		SettingsCharacteristicUUID        string `json:"settingsCharacteristicUUID"`
+		TimeSyncCharacteristicUUID        string `json:"timeSyncCharacteristicUUID"`
 		RateLimiting                      struct {
 			WriteIntervalMs int    `json:"writeIntervalMs"`
 			Description     string `json:"description"`
