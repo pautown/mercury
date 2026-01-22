@@ -348,12 +348,13 @@ type MediaStateUpdate struct {
 	IsPlaying     bool   `json:"isPlaying"`
 	PlaybackState string `json:"playbackState"` // Android sends "playing", "paused", "stopped"
 	TrackTitle    string `json:"trackTitle"`
-	Artist        string `json:"artist"`   // Fixed: matches Android server @SerializedName
-	Album         string `json:"album"`    // Fixed: matches Android server @SerializedName
-	Duration      int64  `json:"duration"` // Fixed: matches Android server @SerializedName
-	Position      int64  `json:"position"` // Fixed: matches Android server @SerializedName
+	Artist        string `json:"artist"`       // Fixed: matches Android server @SerializedName
+	Album         string `json:"album"`        // Fixed: matches Android server @SerializedName
+	Duration      int64  `json:"duration"`     // Fixed: matches Android server @SerializedName
+	Position      int64  `json:"position"`     // Fixed: matches Android server @SerializedName
 	Volume        int    `json:"volume"`
 	AlbumArtHash  string `json:"albumArtHash,omitempty"`
+	MediaChannel  string `json:"mediaChannel,omitempty"` // App being controlled (e.g., "Spotify", "YouTube Music")
 }
 
 // PlaybackCommand represents a command to send to the server
@@ -365,6 +366,7 @@ type PlaybackCommand struct {
 	EpisodeIndex int    `json:"episodeIndex"`          // DEPRECATED: use EpisodeHash. Note: no omitempty since 0 is valid
 	Offset       int    `json:"offset"`                // For pagination - no omitempty since 0 is valid
 	Limit        int    `json:"limit,omitempty"`       // For pagination (request_podcast_episodes)
+	Channel      string `json:"channel,omitempty"`     // Media channel name for select_media_channel
 }
 
 // Note: AlbumArtRequestCommand removed - Android now proactively sends album art
@@ -1262,6 +1264,7 @@ func (c *Client) handleMediaStateNotification(buf []byte) {
 			Position:     update.Position,
 			Volume:       update.Volume,
 			AlbumArtHash: update.AlbumArtHash,
+			MediaChannel: update.MediaChannel,
 		}
 
 		if err := c.redisStore.StoreMediaState(redisState); err != nil {
@@ -2242,6 +2245,7 @@ func (c *Client) validatePlaybackCommand(cmd *redis.PlaybackCommand) error {
 		"request_podcast_episodes": true, // get episodes for specific podcast (paginated)
 		"request_lyrics":           true, // request lyrics for artist/track
 		"request_media_channels":   true, // get list of media channel apps (Spotify, YouTube, etc.)
+		"select_media_channel":     true, // select which media channel app to control
 	}
 
 	if !validActions[cmd.Action] {
@@ -2306,6 +2310,7 @@ func (c *Client) convertToBLECommand(cmd *redis.PlaybackCommand) (*PlaybackComma
 		EpisodeIndex: cmd.EpisodeIndex,
 		Offset:       cmd.Offset,
 		Limit:        cmd.Limit,
+		Channel:      cmd.Channel,
 	}
 
 	// Map certain Redis commands to BLE equivalents
@@ -2373,10 +2378,19 @@ func (c *Client) convertToBLECommand(cmd *redis.PlaybackCommand) (*PlaybackComma
 		log.Printf("📺 MEDIA: Request media channel apps list")
 		log.Printf("   → Target: Android MediaDash via BLE")
 		log.Printf("   → Response: Binary format, will be stored in media:channels Redis key")
+	case "select_media_channel":
+		log.Printf("═══════════════════════════════════════════════════════")
+		log.Printf("🎛️ MEDIA: Select media channel to control")
+		log.Printf("   → Channel: %s", cmd.Channel)
+		log.Printf("   → Target: Android MediaDash via BLE")
+		// Store the selected channel in Redis for local access
+		if cmd.Channel != "" {
+			c.redisStore.StoreControlledChannel(cmd.Channel)
+		}
 	}
 
-	log.Printf("Converted command: %s -> BLE{Action: %s, Value: %d, PodcastId: %s, EpisodeIndex: %d, Offset: %d, Limit: %d}",
-		cmd.Action, bleCmd.Action, bleCmd.Value, bleCmd.PodcastId, bleCmd.EpisodeIndex, bleCmd.Offset, bleCmd.Limit)
+	log.Printf("Converted command: %s -> BLE{Action: %s, Value: %d, PodcastId: %s, EpisodeIndex: %d, Offset: %d, Limit: %d, Channel: %s}",
+		cmd.Action, bleCmd.Action, bleCmd.Value, bleCmd.PodcastId, bleCmd.EpisodeIndex, bleCmd.Offset, bleCmd.Limit, bleCmd.Channel)
 
 	return bleCmd, nil
 }

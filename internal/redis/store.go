@@ -31,6 +31,7 @@ type MediaState struct {
 	Volume       int    `json:"volume"`
 	Timestamp    int64  `json:"timestamp"`
 	AlbumArtHash string `json:"albumArtHash,omitempty"`
+	MediaChannel string `json:"mediaChannel,omitempty"` // App being controlled (e.g., "Spotify", "YouTube Music")
 }
 
 // PlaybackCommand represents a playback control command
@@ -48,6 +49,8 @@ type PlaybackCommand struct {
 	// Lyrics-specific fields for request_lyrics command
 	Artist string `json:"artist,omitempty"` // Artist name for lyrics lookup
 	Track  string `json:"track,omitempty"`  // Track name for lyrics lookup
+	// Media channel selection
+	Channel string `json:"channel,omitempty"` // Media channel name for select_media_channel
 }
 
 // AlbumArtRequest represents a request for album art data
@@ -398,6 +401,11 @@ func (s *Store) StoreMediaState(state *MediaState) error {
 		pipe.Set(s.ctx, progressKey, fmt.Sprintf("%d", progressSeconds), 0)
 	}
 
+	// Store the controlled media channel (e.g., "Spotify", "YouTube Music")
+	if state.MediaChannel != "" {
+		pipe.Set(s.ctx, "media:controlled_channel", state.MediaChannel, 0)
+	}
+
 	_, err := pipe.Exec(s.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to store media state: %w", err)
@@ -405,7 +413,11 @@ func (s *Store) StoreMediaState(state *MediaState) error {
 
 	// Only log successful storage - the BLE handler now controls when this is called
 	// so we avoid duplicate "stored" messages for unchanged data
-	log.Printf("Stored media state: %s - %s (%v)", state.Artist, state.TrackTitle, state.IsPlaying)
+	channelInfo := ""
+	if state.MediaChannel != "" {
+		channelInfo = fmt.Sprintf(" [%s]", state.MediaChannel)
+	}
+	log.Printf("Stored media state: %s - %s (%v)%s", state.Artist, state.TrackTitle, state.IsPlaying, channelInfo)
 	return nil
 }
 
@@ -1638,4 +1650,24 @@ func (s *Store) GetMediaChannels() (*MediaChannelsResponse, error) {
 	}
 
 	return &response, nil
+}
+
+// StoreControlledChannel stores the currently controlled media channel name
+func (s *Store) StoreControlledChannel(channel string) error {
+	if err := s.client.Set(s.ctx, "media:controlled_channel", channel, 0).Err(); err != nil {
+		log.Printf("Failed to store controlled channel: %v", err)
+		return err
+	}
+
+	log.Printf("Stored controlled channel: %s", channel)
+	return nil
+}
+
+// GetControlledChannel retrieves the currently controlled media channel name
+func (s *Store) GetControlledChannel() (string, error) {
+	result, err := s.client.Get(s.ctx, "media:controlled_channel").Result()
+	if err != nil {
+		return "", err
+	}
+	return result, nil
 }
