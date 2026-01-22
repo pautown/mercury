@@ -1,331 +1,345 @@
-# Mercury
+# MediaDash Go BLE Client
 
-An always-on daemon that bridges the Janus phone companion app and the llizard CarThing UI over Bluetooth Low Energy. It uses Redis as the contract between BLE and the UI—connection health, media metadata, album art, podcast data, and user commands all flow through Redis keys.
+An always-on daemon that bridges the MediaDash Android companion app and the llizard CarThing UI over Bluetooth Low Energy. It uses Redis as the contract between BLE and the UI, enabling connection health monitoring, media metadata synchronization, album art transfers, podcast data management, lyrics display, and playback commands to flow through well-known Redis keys.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [BLE Protocol](#ble-protocol)
+- [Redis Schema](#redis-schema)
+- [Album Art Protocol](#album-art-protocol)
+- [Command Processing](#command-processing)
+- [Configuration](#configuration)
+- [Build and Deployment](#build-and-deployment)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
 
 ## Overview
 
-Mercury acts as a bridge between:
-- **Phone** (Janus app - Android now, iOS coming soon) - Sends media state, album art, and podcast data via BLE
-- **CarThing UI** (llizardgui-host) - Reads state from Redis and sends commands
+MediaDash BLE Client acts as a bridge between:
 
-All data flows through Redis, providing a clean separation between the BLE complexity and the UI layer.
+- **Phone** (MediaDash Android app) - Sends media state, album art, podcast data, and lyrics via BLE notifications
+- **CarThing UI** (llizardgui-host) - Reads state from Redis and enqueues commands
+
+All data flows through Redis, providing a clean separation between BLE complexity and the UI layer.
 
 **Target Platform:** ARM Linux (Spotify CarThing - ARMv7, Cortex-A7)
 **BLE Stack:** TinyGo Bluetooth (`tinygo.org/x/bluetooth`)
-**Database:** Redis for state synchronization
+**Database:** Redis 6+ for state synchronization
 
-## Build Commands
+### Key Features
 
-### Native Build (Development/Testing)
-```bash
-go build -o bin/mediadash-client ./cmd/mediadash-client
-go run ./cmd/mediadash-client
-```
-
-### Cross-Compile for CarThing (ARM)
-```bash
-GOOS=linux GOARCH=arm GOARM=7 go build -o bin/mediadash-client ./cmd/mediadash-client
-```
-
-### Build and Deploy Script
-```bash
-./build-deploy.sh build-deploy    # Build ARM binary and deploy to CarThing
-./build-deploy.sh build           # Just build
-./build-deploy.sh deploy          # Deploy existing binary
-./build-deploy.sh status          # Check deployment status
-./build-deploy.sh --native        # Build for local machine instead of ARM
-```
+- Intelligent BLE device scanning with service UUID filtering
+- Rate-limited BLE writes to prevent ATT error 0x0e (resource exhaustion)
+- Activity-based connection health monitoring
+- Command retry queue with exponential backoff
+- Chunked album art transfers with base64/binary protocol support
+- Real-time playback position tracking (TimeTracker)
+- Podcast data lazy loading with compact BLE format
+- Lyrics synchronization support
 
 ## Architecture
 
 ### Data Flow
 
 ```
-┌─────────────────┐                 ┌──────────────┐                 ┌─────────────────┐
-│                 │  BLE (Notify)   │              │   Redis Keys    │                 │
-│      Phone      │ ───────────────>│  Go Client   │ ───────────────>│  CarThing UI    │
-│     (Janus)     │                 │              │                 │  (llizardgui)   │
-│                 │<────────────────│              │<────────────────│                 │
-└─────────────────┘  BLE (Write)    └──────────────┘  Redis Queue    └─────────────────┘
-                    (Commands)                        (Commands)
+                              ┌──────────────────────────────────────┐
+                              │         MediaDash BLE Client         │
+                              │                                      │
+┌─────────────────┐  BLE      │  ┌────────────┐    ┌─────────────┐  │  Redis     ┌─────────────────┐
+│                 │  Notify   │  │            │    │             │  │  Keys      │                 │
+│     Android     │──────────>│  │  BLE I/O   │───>│ Redis Store │──┼──────────>│  CarThing UI    │
+│   MediaDash     │           │  │            │    │             │  │           │  (llizardgui)   │
+│                 │<──────────│  │            │<───│             │<─┼───────────│                 │
+└─────────────────┘  BLE      │  └────────────┘    └─────────────┘  │  Redis    └─────────────────┘
+                     Write    │                                      │  Queue
+                   (Commands) │  ┌────────────────────────────────┐  │
+                              │  │  Album Art Handler             │  │
+                              │  │  - Chunked reassembly          │  │
+                              │  │  - CRC32 validation            │  │
+                              │  │  - Disk + Redis caching        │  │
+                              │  └────────────────────────────────┘  │
+                              └──────────────────────────────────────┘
 ```
 
-#### BLE → Redis
-The client subscribes to BLE characteristics and writes incoming data to Redis:
-- **Media metadata** → `media:track`, `media:artist`, `media:album`, `media:playing`
-- **Playback position/duration** → `media:progress`, `media:duration`
-- **Album art** → `/var/mediadash/album_art_cache/` + `media:art_path`
-- **Podcast data** → `podcast:list`, `podcast:recent`, `podcast:episodes:<hash>`
-- **Connection status** → `system:ble_connected`, `system:ble_name`, `ble:status:*`
-
-#### Redis → BLE
-The UI enqueues commands in Redis; the client dequeues and forwards them via BLE:
-- **Playback commands** → `system:playback_cmd_q` (play, pause, next, previous, seek, volume)
-- **Album art requests** → `mediadash:albumart:request`
-- **Podcast requests** → `podcast:request_q`
-
-### Key Packages
-
-#### `cmd/mediadash-client`
-Entry point that:
-- Loads embedded configuration from `internal/config/config.json`
-- Initializes BLE adapter and Redis connection
-- Wires graceful shutdown handlers
-- Starts goroutines for BLE I/O, command processing, and status monitoring
-
-#### `internal/ble`
-Core BLE client (`client.go`):
-- **Device scanning** with Janus service UUID filtering
-- **Characteristic subscriptions** for media state, album art, and podcast data
-- **Rate-limited writes** (15ms intervals) to prevent ATT error 0x0e
-- **Connection health monitoring** with activity-based checks
-- **Command retry queue** with exponential backoff
-- **TimeTracker** for real-time position updates (1-second increments)
-- **Chunk reassembly** for album art and podcast responses
-
-#### `internal/redis`
-Redis operations (`store.go`):
-- `StoreMediaState()` - Writes track/artist/album/position/duration
-- `DequeuePlaybackCommand()` - Pops commands from `system:playback_cmd_q`
-- `PublishBLEStatus()` - Updates connection status for UI health indicators
-- `SetAlbumArtFilePath()` - Points UI to cached album art
-- `StorePodcastList()`, `StoreRecentEpisodes()`, `StorePodcastEpisodes()` - Podcast data storage
-- `StoreAlbumArtCache()`, `GetAlbumArtCache()` - Album art cache management
-
-**Compact BLE Response Types:**
-- `CompactPodcastListResponse` - Podcast channel list (type 1)
-- `CompactRecentEpisodesResponse` - Recent episodes across all podcasts (type 2)
-- `CompactPodcastEpisodesResponse` - Paginated episodes for a specific podcast (type 3)
-
-#### `internal/albumart`
-Album art handling (`handler.go`):
-- `GenerateAlbumArtHash(artist, album)` - CRC32 hash matching Android algorithm
-- **Chunked transfer reassembly** with base64 decoding
-- **Disk cache** at `/var/mediadash/album_art_cache/`
-- **Retry manager** for failed transfers
-
-#### `internal/config`
-Configuration management:
-- Embedded `config.json` via `//go:embed`
-- BLE UUIDs, rate limiting parameters
-- Redis key mappings
-- Album art cache settings
-
-#### `internal/settings`
-Runtime settings hot-reload:
-- Scan intervals, RSSI thresholds, feature flags
-- No rebuild required for configuration changes
-
-## Compact BLE Format
-
-The client implements a bandwidth-optimized format for podcast responses to minimize BLE transmission overhead.
-
-### 3-Byte Header Format
-
-Podcast responses use a **3-byte header** followed by chunked JSON data:
+### Package Structure
 
 ```
-[type][chunkIndex][totalChunks][data...]
+golang_ble_client/
+├── cmd/
+│   └── mediadash-client/
+│       └── main.go              # Entry point, signal handling, status monitoring
+├── internal/
+│   ├── ble/
+│   │   ├── client.go            # Core BLE client, scanning, connections
+│   │   └── errorlog.go          # Crash/error logging to persistent files
+│   ├── redis/
+│   │   └── store.go             # Redis operations, key mappings, type definitions
+│   ├── albumart/
+│   │   ├── handler.go           # Transfer reassembly, disk caching
+│   │   ├── validation.go        # Security validation, format detection
+│   │   ├── retry.go             # Retry manager with exponential backoff
+│   │   └── migration.go         # Cache migration utilities
+│   ├── config/
+│   │   ├── loader.go            # Embedded config loading
+│   │   └── config.json          # BLE UUIDs, Redis keys, settings
+│   ├── settings/
+│   │   └── handler.go           # Runtime settings hot-reload
+│   └── debug/
+│       └── debug.go             # Debug logging utilities
+├── scripts/
+│   └── test-commands.sh         # Interactive command testing
+├── config.json                  # Root config (embedded at build)
+└── build-deploy.sh              # Build and deployment automation
 ```
 
-- **Byte 0 (type):** Response type (1-3)
-  - `1` = Podcast List (A-Z channel list)
-  - `2` = Recent Episodes (recent episodes across all podcasts)
-  - `3` = Podcast Episodes (paginated episodes for a specific podcast)
-- **Byte 1 (chunkIndex):** Current chunk index (0-based)
-- **Byte 2 (totalChunks):** Total number of chunks
+### Key Components
 
-**Legacy 2-byte header** (backwards compatibility):
-```
-[chunkIndex][totalChunks][data...]
-```
-- Detected when byte 0 is outside 1-3 range
-- Used for old Android app versions
+#### BLE Client (`internal/ble/client.go`)
 
-### JSON Field Compression
+The core BLE client manages:
 
-JSON field names are shortened to reduce payload size by ~55%:
+- **Device Scanning**: Filters for MediaDash service UUID, falls back to name-based matching
+- **Characteristic Subscriptions**: Media state, album art, podcast info, lyrics
+- **Rate-Limited Writes**: Configurable intervals (default 15ms) to prevent ATT errors
+- **Connection Health**: Activity-based monitoring, automatic reconnection
+- **TimeTracker**: Real-time position updates between Android notifications
+- **Flow Control**: Separate notification buffers for media state (200) and album art (4096)
 
-#### Type 1: Podcast List
+#### Redis Store (`internal/redis/store.go`)
+
+Provides typed helpers for all Redis operations:
+
+- `StoreMediaState()` - Track, artist, album, position, duration, playing state
+- `DequeuePlaybackCommand()` - Pop commands from queue with timeout
+- `PublishBLEStatus()` - Connection status for UI health indicators
+- `StorePodcastList()`, `StoreRecentEpisodes()`, `StorePodcastEpisodes()` - Podcast data
+- `StoreLyricsChunk()`, `GetLyrics()` - Lyrics with timestamp support
+- `StoreAlbumArtCache()`, `GetAlbumArtCache()` - Album art blob caching
+
+#### Album Art Handler (`internal/albumart/`)
+
+Manages album art transfers with:
+
+- **Chunked Reassembly**: Handles both legacy JSON/base64 and binary protocols
+- **CRC32 Validation**: Per-chunk integrity checking
+- **Disk Caching**: `/var/mediadash/album_art_cache/` with WebP format
+- **Redis Mirroring**: Syncs disk cache to Redis for quick lookups
+- **Retry Manager**: Automatic retry with selective chunk re-requests
+- **Format Validation**: JPEG, PNG, WebP detection via magic bytes
+
+## BLE Protocol
+
+### Service and Characteristics
+
+**Service UUID:** `0000a0d0-0000-1000-8000-00805f9b34fb`
+
+| Characteristic | UUID | Direction | Description |
+|----------------|------|-----------|-------------|
+| Media State | `0000a0d1-...` | Android → Client | JSON media metadata notifications |
+| Playback Control | `0000a0d2-...` | Client → Android | JSON playback commands |
+| Album Art Request | `0000a0d3-...` | Client → Android | Request specific album art (recovery) |
+| Album Art Data | `0000a0d4-...` | Android → Client | Chunked album art (binary/base64) |
+| Podcast Info | `0000a0d5-...` | Bidirectional | Podcast data with compact format |
+| Lyrics Request | `0000a0d6-...` | Client → Android | Request lyrics for track |
+| Lyrics Data | `0000a0d7-...` | Android → Client | Chunked lyrics with timestamps |
+| Settings | `0000a0d8-...` | Bidirectional | Configuration sync |
+| Time Sync | `0000a0d9-...` | Bidirectional | Clock synchronization |
+
+### Media State Notification Format
+
 ```json
 {
-  "p": [
-    {"h": "abc12345", "n": "Podcast Name", "c": 50}
-  ],
-  "np": {"h": "abc12345", "t": "Episode Title", "i": 0}
+  "isPlaying": true,
+  "playbackState": "playing",
+  "trackTitle": "Song Name",
+  "artist": "Artist Name",
+  "album": "Album Name",
+  "duration": 240000,
+  "position": 120000,
+  "volume": 75,
+  "albumArtHash": "1234567890",
+  "mediaChannel": "Spotify"
 }
 ```
-- `p` = podcasts array
-- `h` = hash (podcast ID)
-- `n` = name (podcast title)
-- `c` = count (episode count)
-- `np` = now playing (optional)
-- `t` = title (episode title)
-- `i` = index (episode index)
 
-#### Type 2: Recent Episodes
-```json
-{
-  "e": [
-    {"h": "a1b2c3d4", "c": "Channel", "t": "Title", "d": 3600, "i": 0}
-  ],
-  "t": 100
+**Note:** Duration and position are in milliseconds from Android, converted to seconds for Redis storage.
+
+### Rate Limiting
+
+All BLE writes use rate limiting to prevent ATT error 0x0e (resource exhaustion):
+
+```go
+func (c *Client) rateLimitedWrite(char *bluetooth.DeviceCharacteristic, data []byte) (int, error) {
+    // Minimum 15ms between writes (configurable)
+    // Token bucket pattern with write mutex
 }
 ```
-- `e` = episodes array
-- `h` = hash (episode hash)
-- `c` = channel (podcast/channel title)
-- `t` = title (episode title)
-- `d` = duration (in SECONDS)
-- `i` = index (episode index for playback)
 
-#### Type 3: Podcast Episodes
-```json
-{
-  "h": "abc",
-  "n": "Podcast",
-  "t": 50,
-  "o": 0,
-  "m": true,
-  "e": [
-    {"h": "a1b2c3d4", "t": "Episode Title", "d": 3600}
-  ]
-}
-```
-- `h` = hash (podcast ID hash)
-- `n` = name (podcast title)
-- `t` = total (total episodes)
-- `o` = offset (current offset)
-- `m` = more (has more episodes)
-- `e` = episodes array
-  - `h` = hash (episode hash)
-  - `t` = title (episode title)
-  - `d` = duration (in SECONDS)
-
-### Chunk Reassembly
-
-The client maintains **separate chunk storage** for each response type to support concurrent transfers:
-- `podcastListChunks` - Type 1 chunks
-- `podcastRecentChunks` - Type 2 chunks
-- `podcastEpisodesChunks` - Type 3 chunks
-
-Chunks are reassembled when all pieces arrive, then the complete JSON is parsed and stored in Redis.
-
-## Redis Key Schema
+## Redis Schema
 
 ### Media State Keys
-| Key | Description | Example Value |
-|-----|-------------|---------------|
-| `media:track` | Current track title | "Song Title" |
-| `media:artist` | Current artist | "Artist Name" |
-| `media:album` | Current album | "Album Name" |
-| `media:playing` | Playback state | "true" or "false" |
-| `media:duration` | Duration in seconds | "240" |
-| `media:progress` | Position in seconds | "120" |
-| `media:art_path` | File path to cached album art | "/var/mediadash/album_art_cache/1234567890.jpg" |
 
-### BLE Connection Keys
-| Key | Description | Example Value |
-|-----|-------------|---------------|
-| `system:ble_connected` | BLE connection status | "true" or "false" |
-| `system:ble_name` | Connected device name | "Pixel 7" |
-| `ble:status:connected` | Detailed connection status | "true" |
-| `ble:status:device_name` | Device name | "Pixel 7" |
-| `ble:status:device_address` | Device MAC address | "AA:BB:CC:DD:EE:FF" |
-| `ble:status:rssi` | Signal strength | "-65" |
-| `ble:status:connection_quality` | Connection quality | "good" |
-| `ble:status:last_update` | Last update timestamp (ms) | "1234567890123" |
-| `ble:status:commands_processed` | Total commands processed | "42" |
-| `ble:status:commands_failed` | Total commands failed | "2" |
+| Key | Type | Description | Example |
+|-----|------|-------------|---------|
+| `media:track` | String | Current track title | "Bohemian Rhapsody" |
+| `media:artist` | String | Current artist | "Queen" |
+| `media:album` | String | Current album | "A Night at the Opera" |
+| `media:playing` | String | Playback state | "true" or "false" |
+| `media:duration` | String | Duration in seconds | "354" |
+| `media:progress` | String | Position in seconds | "120" |
+| `media:album_art_path` | String | Path to cached art | "/var/mediadash/album_art_cache/1234567890.webp" |
+| `media:controlled_channel` | String | Active media app | "Spotify" |
+| `media:channels` | JSON | Available media apps | `{"channels":["Spotify","YouTube Music"],...}` |
+
+### BLE Status Keys
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `system:ble_connected` | String | "true" or "false" |
+| `system:ble_name` | String | Connected device name |
+| `ble:status:connected` | String | Detailed connection status |
+| `ble:status:device_name` | String | Device name |
+| `ble:status:device_address` | String | MAC address |
+| `ble:status:rssi` | String | Signal strength |
+| `ble:status:connection_quality` | String | "excellent", "good", "fair", "poor" |
+| `ble:status:last_update` | String | Unix timestamp (ms) |
+| `ble:status:commands_processed` | String | Total commands sent |
+| `ble:status:commands_failed` | String | Failed command count |
+| `ble:status:scanning` | String | "true" if scanning |
 
 ### Command Queues
-| Key | Description | Type |
-|-----|-------------|------|
-| `system:playback_cmd_q` | Playback command queue | List (JSON objects) |
-| `podcast:request_q` | Podcast info request queue | List (JSON objects) |
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `system:playback_cmd_q` | List | Playback commands (JSON) |
+| `system:podcast_request_q` | List | Podcast data requests (JSON) |
+| `system:ble_reconnect_request` | String | Timestamp to trigger reconnect |
 
 ### Album Art Cache
-| Key | Description | Type |
-|-----|-------------|------|
-| `mediadash:albumart:cache:<hash>` | Cached album art data | Binary (JPEG) |
-| `mediadash:albumart:cache:<hash>:meta` | Album art metadata | JSON |
-| `mediadash:albumart:request` | Album art request | JSON |
+
+| Key Pattern | Type | Description |
+|-------------|------|-------------|
+| `mediadash:albumart:cache:<hash>` | Binary | Cached album art data |
+| `mediadash:albumart:cache:<hash>:meta` | JSON | Metadata (size, timestamp) |
+| `mediadash:albumart:request` | JSON | Pending request |
 
 ### Podcast Keys
-| Key | Description | Type |
-|-----|-------------|------|
-| `podcast:list` | Compact podcast channel list (type 1) | JSON |
-| `podcast:recent` | Compact recent episodes (type 2) | JSON |
-| `podcast:episodes:<hash>` | Compact podcast episodes (type 3) | JSON |
-| `podcast:channel_count` | Total podcast channel count | Integer |
 
-### Legacy Podcast Keys (Deprecated)
-| Key | Description |
-|-----|-------------|
-| `podcast:show_name` | Current podcast show name |
-| `podcast:episode_title` | Current episode title |
-| `podcast:episode_description` | Current episode description |
-| `podcast:author` | Podcast author |
-| `podcast:episode_count` | Total episodes |
-| `podcast:current_index` | Current episode index |
-| `podcast:episode_list` | Episode list (JSON array) |
+| Key | Type | Description |
+|-----|------|-------------|
+| `podcast:list` | JSON | Channel list (compact format) |
+| `podcast:recent_episodes` | JSON | Recent episodes across all podcasts |
+| `podcast:episodes:<hash>` | JSON | Paginated episodes for specific podcast |
+| `podcast:channel_count` | String | Total podcast count |
 
-## Command Queue Format
+### Lyrics Keys
 
-Commands in `system:playback_cmd_q` are JSON objects:
+| Key | Type | Description |
+|-----|------|-------------|
+| `lyrics:data` | JSON | Complete lyrics with timestamps |
+| `lyrics:hash` | String | CRC32 hash of "artist\|track" |
+| `lyrics:synced` | String | "true" if has timestamps |
+| `lyrics:enabled` | String | Feature toggle |
 
-### Playback Commands
+## Album Art Protocol
+
+### Hash Generation
+
+Both Android and Go client use identical CRC32 hashing:
+
+```go
+func GenerateAlbumArtHash(artist, album string) string {
+    // Normalize: lowercase and trim whitespace
+    artistLower := strings.ToLower(strings.TrimSpace(artist))
+    albumLower := strings.ToLower(strings.TrimSpace(album))
+
+    // Composite string with pipe separator
+    composite := artistLower + "|" + albumLower
+
+    // CRC32-IEEE checksum as DECIMAL string (not hex!)
+    hash := crc32.ChecksumIEEE([]byte(composite))
+    return fmt.Sprintf("%d", hash)  // e.g., "3462671303"
+}
+```
+
+**Critical:** The hash is a decimal string (8-10 digits), not hexadecimal.
+
+### Binary Protocol (Current)
+
+16-byte header + raw image data per chunk:
+
+| Offset | Size | Type | Field |
+|--------|------|------|-------|
+| 0 | 4 | uint32 | hash (CRC32 as uint32, little-endian) |
+| 4 | 2 | uint16 | chunkIndex (0-based) |
+| 6 | 2 | uint16 | totalChunks |
+| 8 | 2 | uint16 | dataLength |
+| 10 | 4 | uint32 | dataCRC32 (chunk data checksum) |
+| 14 | 2 | uint16 | reserved |
+| 16+ | N | bytes | raw image data (max 496 bytes) |
+
+### Legacy JSON Protocol (Deprecated)
+
 ```json
 {
-  "action": "play|pause|next|previous|toggle",
+  "hash": "3462671303",
+  "chunkIndex": 0,
+  "totalChunks": 15,
+  "data": "base64EncodedImageData...",
+  "crc32": 12345678
+}
+```
+
+### Transfer Flow
+
+1. **Track Change**: Android sends media state with `albumArtHash`
+2. **Cache Check**: Client checks disk cache for existing art
+3. **Cache Hit**: Update `media:album_art_path` immediately
+4. **Cache Miss**: Wait for Android to proactively send chunks
+5. **Chunk Reception**: Validate CRC32, store in transfer buffer
+6. **Completion**: Reassemble chunks, validate format, cache to disk and Redis
+7. **Recovery**: On failure, request retransmission via Album Art Request characteristic
+
+## Command Processing
+
+### Command Format
+
+```json
+{
+  "action": "play|pause|next|previous|seek|volume|toggle|stop",
+  "value": 0,
   "timestamp": 1234567890
 }
 ```
 
-### Seek Command
-```json
-{
-  "action": "seek",
-  "value": 120,
-  "timestamp": 1234567890
-}
-```
+### Supported Actions
 
-### Volume Command
-```json
-{
-  "action": "volume",
-  "value": 75,
-  "timestamp": 1234567890
-}
-```
+| Action | Value | Description |
+|--------|-------|-------------|
+| `play` | - | Start playback |
+| `pause` | - | Pause playback |
+| `toggle` | - | Toggle play/pause |
+| `next` | - | Next track |
+| `previous` | - | Previous track |
+| `seek` | ms | Seek to position |
+| `volume` | 0-100 | Set volume level |
+| `stop` | - | Stop playback |
 
-### Podcast Playback Command
-```json
-{
-  "action": "play_podcast_episode",
-  "podcastId": "abc12345",
-  "episodeIndex": 3,
-  "timestamp": 1234567890
-}
-```
+### Podcast Commands
 
-### Podcast Request Commands
 ```json
 {
   "action": "request_podcast_list",
   "timestamp": 1234567890
 }
-```
 
-```json
 {
   "action": "request_recent_episodes",
   "timestamp": 1234567890
 }
-```
 
-```json
 {
   "action": "request_podcast_episodes",
   "podcastId": "abc12345",
@@ -333,22 +347,57 @@ Commands in `system:playback_cmd_q` are JSON objects:
   "limit": 50,
   "timestamp": 1234567890
 }
+
+{
+  "action": "play_episode",
+  "episodeHash": "def67890",
+  "timestamp": 1234567890
+}
 ```
+
+### Lyrics Commands
+
+```json
+{
+  "action": "request_lyrics",
+  "artist": "Artist Name",
+  "track": "Track Name",
+  "timestamp": 1234567890
+}
+```
+
+### Processing Pipeline
+
+```
+Redis Queue → Validation → BLE Conversion → Rate Limiting → Android GATT
+                 ↓ (on failure)
+           Retry Queue → Exponential Backoff → Retry (max 3 attempts)
+```
+
+### Retry Configuration
+
+- **Max Retries:** 3 attempts
+- **Initial Delay:** 2 seconds
+- **Backoff:** Exponential (2s, 4s, 6s)
+- **Retryable Errors:** ATT failures, connection issues, rate limit violations
+- **Non-Retryable:** Validation failures, JSON errors
 
 ## Configuration
 
-Configuration is embedded in the binary via `//go:embed` in `internal/config/config.json`:
+Configuration is embedded via `//go:embed` from `internal/config/config.json`:
 
-### BLE Settings
 ```json
 {
   "ble": {
+    "deviceName": "MediaDash",
     "serviceUUID": "0000a0d0-0000-1000-8000-00805f9b34fb",
     "mediaStateCharacteristicUUID": "0000a0d1-0000-1000-8000-00805f9b34fb",
     "playbackControlCharacteristicUUID": "0000a0d2-0000-1000-8000-00805f9b34fb",
     "albumArtRequestCharacteristicUUID": "0000a0d3-0000-1000-8000-00805f9b34fb",
     "albumArtDataCharacteristicUUID": "0000a0d4-0000-1000-8000-00805f9b34fb",
     "podcastInfoCharacteristicUUID": "0000a0d5-0000-1000-8000-00805f9b34fb",
+    "lyricsRequestCharacteristicUUID": "0000a0d6-0000-1000-8000-00805f9b34fb",
+    "lyricsDataCharacteristicUUID": "0000a0d7-0000-1000-8000-00805f9b34fb",
     "rateLimiting": {
       "writeIntervalMs": 15
     },
@@ -356,13 +405,7 @@ Configuration is embedded in the binary via `//go:embed` in `internal/config/con
       "healthCheckIntervalMinutes": 1,
       "activityTimeoutMinutes": 1
     }
-  }
-}
-```
-
-### Redis Settings
-```json
-{
+  },
   "redis": {
     "address": "127.0.0.1:6379",
     "keyMap": {
@@ -372,178 +415,235 @@ Configuration is embedded in the binary via `//go:embed` in `internal/config/con
       "isPlaying": "media:playing",
       "durationMs": "media:duration",
       "progressMs": "media:progress",
-      "albumArtPath": "media:art_path",
+      "albumArtPath": "media:album_art_path",
       "bleConnected": "system:ble_connected",
       "bleName": "system:ble_name",
-      "playbackCommandQueue": "system:playback_cmd_q",
-      "podcastRequestQueue": "podcast:request_q"
+      "playbackCommandQueue": "system:playback_cmd_q"
     }
-  }
-}
-```
-
-### Album Art Settings
-```json
-{
+  },
   "albumArt": {
     "cacheDirectory": "/var/mediadash/album_art_cache",
-    "image": {
-      "format": "jpg",
-      "maxWidth": 200,
-      "maxHeight": 200,
-      "quality": 75
-    },
     "ble": {
-      "chunkSize": 300
+      "chunkSize": 512
     }
   }
 }
 ```
 
-## Deployment
+## Build and Deployment
 
-### CarThing Device Access
-- **IP:** `172.16.42.2`
+### Prerequisites
+
+- Go 1.21+
+- Redis 6+ (on CarThing or localhost for testing)
+- CarThing device with llizardOS
+
+### Native Build (Development)
+
+```bash
+go build -o bin/mediadash-client ./cmd/mediadash-client
+./bin/mediadash-client
+```
+
+### Cross-Compile for CarThing (ARM)
+
+```bash
+GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -o bin/mediadash-client ./cmd/mediadash-client
+```
+
+### Build and Deploy Script
+
+```bash
+./build-deploy.sh build           # Build ARM binary
+./build-deploy.sh deploy          # Deploy to CarThing
+./build-deploy.sh build-deploy    # Build and deploy
+./build-deploy.sh status          # Check deployment status
+./build-deploy.sh logs            # View client logs
+./build-deploy.sh --native        # Build for local machine
+```
+
+### CarThing Access
+
+- **IP:** `172.16.42.2` (USB network)
 - **User:** `root`
 - **Password:** `llizardos`
 
 ### Manual Deployment
+
 ```bash
-# Build for ARM
+# Build ARM binary
 GOOS=linux GOARCH=arm GOARM=7 go build -o bin/mediadash-client ./cmd/mediadash-client
 
 # Copy to CarThing
-scp bin/mediadash-client root@172.16.42.2:/tmp/
+scp bin/mediadash-client root@172.16.42.2:/usr/bin/
 
-# SSH into CarThing and run
+# SSH and verify
 ssh root@172.16.42.2
-cd /tmp
-./mediadash-client
-```
-
-### Automated Deployment
-```bash
-./build-deploy.sh build-deploy
-```
-
-This script:
-1. Builds the ARM binary
-2. Copies it to `/tmp/` on the CarThing
-3. Ensures Redis is running
-4. Starts the client
-
-### Redis Setup on CarThing
-
-Redis must be running for the client to function:
-
-```bash
-# Start Redis service
-sshpass -p llizardos ssh root@172.16.42.2 "sv start redis"
-
-# Check Redis status
-sshpass -p llizardos ssh root@172.16.42.2 "sv status redis"
-
-# Test Redis connection
-sshpass -p llizardos ssh root@172.16.42.2 "redis-cli ping"
+sv status mediadash-client
 ```
 
 ### Running as a Service
 
-Mercury is configured to run as a runit service on llizardOS for automatic startup.
+On llizardOS, the client runs as a runit service:
 
-## Key Implementation Patterns
+```bash
+# Service control
+sv start mediadash-client
+sv stop mediadash-client
+sv restart mediadash-client
+sv status mediadash-client
 
-### BLE Rate Limiting
+# View logs
+tail -f /var/log/mediadash-client/current
+```
 
-All BLE writes go through `rateLimitedWrite()` to prevent **ATT error 0x0e** (resource exhaustion). The default interval is **15ms** between writes, providing a safety margin for Android BLE stack variability and battery optimization delays.
+### Redis Setup on CarThing
 
-### Album Art Protocol
+```bash
+# Start Redis
+sv start redis
 
-Android sends album art as base64-encoded chunks. The hash is **CRC32** of `"artist.lowercase()|album.lowercase()"` as a **decimal string** (not hex). See `ALBUM_ART_PROTOCOL_FIXES.md` for details.
+# Check status
+sv status redis
 
-### TimeTracker
+# Test connection
+redis-cli ping
+```
 
-Maintains real-time playback position by incrementing locally (1-second ticks) between Android updates. This prevents position jumpback from stale duplicate BLE notifications. The tracker:
-- Only starts after receiving initial position data from Android
-- Increments position every second when playing
-- Stops when paused or at end of track
-- Resets on track changes
-
-### Command Retry
-
-Failed commands are queued with **exponential backoff** (2s, 4s, 6s) up to **3 attempts**. Retryable errors include:
-- ATT failures (error 0x0e)
-- BLE connection issues
-- Rate limit violations
-
-### Connection Health Monitoring
-
-The client monitors connection health using **activity-based checks**:
-- Tracks last send/receive activity
-- Only performs health checks if no activity for 1 minute
-- Avoids unnecessary connection tests during active streaming
-- Updates `ble:status:*` keys with connection quality metrics
-
-## Testing Commands
+## Testing
 
 ### Interactive Command Testing
+
 ```bash
 ./scripts/test-commands.sh
 ```
 
-This script provides an interactive menu for testing playback commands via Redis.
+This interactive script provides a menu for:
+- Queuing playback commands
+- Monitoring queue status
+- Viewing Redis state
+- Testing podcast and lyrics commands
 
-### Manual Redis Testing
+### Manual Redis Commands
+
 ```bash
 # Queue a play command
-redis-cli LPUSH system:playback_cmd_q '{"action":"play","timestamp":1234567890}'
+redis-cli LPUSH system:playback_cmd_q '{"action":"play","timestamp":'$(date +%s)'}'
 
 # Queue a seek command
-redis-cli LPUSH system:playback_cmd_q '{"action":"seek","value":60,"timestamp":1234567890}'
+redis-cli LPUSH system:playback_cmd_q '{"action":"seek","value":60000,"timestamp":'$(date +%s)'}'
 
 # Check media state
 redis-cli GET media:track
 redis-cli GET media:artist
 redis-cli GET media:playing
+redis-cli GET media:progress
 
 # Check BLE connection
 redis-cli GET system:ble_connected
-redis-cli GET system:ble_name
+redis-cli GET ble:status:connection_quality
+
+# Check album art
+redis-cli GET media:album_art_path
+redis-cli KEYS "mediadash:albumart:cache:*"
+
+# Check podcast data
+redis-cli GET podcast:list
+redis-cli GET podcast:recent_episodes
 ```
 
-## Documentation
+### Debug Flags
 
-- **`LLM_OVERVIEW.md`** - High-level architecture summary
-- **`COMMAND_PROCESSING.md`** - Command queue protocol details
-- **`ALBUM_ART_PROTOCOL_FIXES.md`** - Album art compatibility fixes
-- **`PERFORMANCE_OPTIMIZATIONS.md`** - BLE performance tuning
-- **`CLAUDE.md`** - Development guidelines for Claude Code
+```bash
+# Enable verbose lyrics logging
+./bin/mediadash-client -debug-lyrics
+```
 
 ## Troubleshooting
 
-### Client won't connect to phone
-1. Ensure Janus app is running and BLE is enabled
-2. Check that CarThing Bluetooth adapter is working: `hciconfig`
-3. Verify the service UUID matches between Janus and client
-4. Check client logs for scanning/pairing errors
+### Client Won't Connect
 
-### Commands not reaching phone
-1. Verify Redis is running: `redis-cli ping`
-2. Check command queue: `redis-cli LRANGE system:playback_cmd_q 0 -1`
-3. Monitor BLE status: `redis-cli GET ble:status:connected`
-4. Check rate limiting isn't blocking writes (15ms minimum interval)
+1. **Verify Android app is running** with BLE enabled
+2. **Check Bluetooth adapter:**
+   ```bash
+   hciconfig
+   hciconfig hci0 up
+   ```
+3. **Verify service UUID** matches between Android and client config
+4. **Check logs for scanning errors:**
+   ```bash
+   journalctl -u mediadash-client -f
+   ```
 
-### Album art not appearing
-1. Verify cache directory exists: `/var/mediadash/album_art_cache/`
-2. Check for album art hash in Redis: `redis-cli KEYS mediadash:albumart:cache:*`
-3. Monitor album art transfer logs for chunk reassembly issues
-4. Ensure hash algorithm matches Android (CRC32 decimal, not hex)
+### Commands Not Reaching Phone
 
-### Position not updating
-1. Check TimeTracker initialization in logs
-2. Verify Android is sending position updates
-3. Monitor `media:progress` key: `redis-cli GET media:progress`
-4. Ensure playback state is correct: `redis-cli GET media:playing`
+1. **Verify Redis connection:**
+   ```bash
+   redis-cli ping
+   ```
+2. **Check command queue:**
+   ```bash
+   redis-cli LRANGE system:playback_cmd_q 0 -1
+   ```
+3. **Monitor BLE status:**
+   ```bash
+   redis-cli GET ble:status:connected
+   redis-cli GET ble:status:commands_processed
+   redis-cli GET ble:status:commands_failed
+   ```
+4. **Check rate limiting** in logs (15ms minimum interval)
+
+### Album Art Not Appearing
+
+1. **Verify cache directory exists:**
+   ```bash
+   ls -la /var/mediadash/album_art_cache/
+   ```
+2. **Check Redis cache:**
+   ```bash
+   redis-cli KEYS "mediadash:albumart:cache:*"
+   ```
+3. **Verify hash algorithm** - must be decimal CRC32, not hex
+4. **Check for transfer errors** in logs (chunk validation, CRC32 mismatch)
+
+### ATT Error 0x0e (Resource Exhaustion)
+
+1. **Increase write interval** in config (try 20ms or 25ms)
+2. **Restart Android app** to clear BLE resources
+3. **Disable Android battery optimization** for MediaDash
+4. **Check for notification buffer drops** in metrics
+
+### Position Not Updating
+
+1. **Verify TimeTracker initialization** in logs
+2. **Check Android is sending position updates**
+3. **Monitor progress key:**
+   ```bash
+   watch -n1 "redis-cli GET media:progress"
+   ```
+4. **Verify playback state:**
+   ```bash
+   redis-cli GET media:playing
+   ```
+
+### High Memory Usage
+
+1. **Check notification buffer utilization:**
+   ```bash
+   # Diagnostic info includes buffer stats
+   redis-cli GET ble:status:last_update
+   ```
+2. **Verify stale transfers are being cleaned up**
+3. **Check retry queue size** in logs
+
+## Additional Documentation
+
+- `COMMAND_PROCESSING.md` - Detailed command queue protocol
+- `ALBUM_ART_PROTOCOL_FIXES.md` - Album art compatibility fixes
+- `PERFORMANCE_OPTIMIZATIONS.md` - BLE performance tuning
+- `OPTIMIZATION_SUMMARY.md` - Summary of optimization changes
+- `LLM_OVERVIEW.md` - Token-optimized architecture summary
+- `CLAUDE.md` - Development guidelines for Claude Code
 
 ## License
 
