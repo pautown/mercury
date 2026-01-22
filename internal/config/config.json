@@ -47,7 +47,9 @@
       "lyricsData": "lyrics:data",
       "lyricsHash": "lyrics:hash",
       "lyricsSynced": "lyrics:synced",
-      "lyricsEnabled": "lyrics:enabled"
+      "lyricsEnabled": "lyrics:enabled",
+      "timezoneOffset": "system:timezone_offset",
+      "timezoneId": "system:timezone_id"
     }
   },
   "albumArt": {

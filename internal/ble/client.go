@@ -1865,6 +1865,8 @@ func (c *Client) handleSettingsNotification(buf []byte) {
 
 // handleTimeSyncNotification processes time sync updates from Android
 // Sets the system time based on Unix timestamp received from the phone
+// Format: "timestamp|offset_minutes|timezone_id" (e.g., "1737590400|-300|America/New_York")
+// Falls back to legacy format (just timestamp) for backwards compatibility
 func (c *Client) handleTimeSyncNotification(buf []byte) {
 	// Update receive activity tracking
 	c.updateReceiveActivity()
@@ -1874,17 +1876,40 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 		return
 	}
 
-	// Parse Unix timestamp (decimal string)
-	timestampStr := strings.TrimSpace(string(buf))
-	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+	// Parse the time sync data
+	dataStr := strings.TrimSpace(string(buf))
+	parts := strings.Split(dataStr, "|")
+
+	var timestamp int64
+	var offsetMinutes int64 = 0
+	var timezoneId string = ""
+
+	// Parse timestamp (required)
+	var err error
+	timestamp, err = strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		log.Printf("[TIME_SYNC] Failed to parse timestamp '%s': %v", timestampStr, err)
+		log.Printf("[TIME_SYNC] Failed to parse timestamp '%s': %v", parts[0], err)
 		return
+	}
+
+	// Parse timezone offset (optional - new format)
+	if len(parts) >= 2 {
+		offsetMinutes, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			log.Printf("[TIME_SYNC] Warning: Failed to parse timezone offset '%s': %v", parts[1], err)
+			offsetMinutes = 0
+		}
+	}
+
+	// Parse timezone ID (optional - new format)
+	if len(parts) >= 3 {
+		timezoneId = parts[2]
 	}
 
 	// Convert to time.Time for logging
 	syncTime := time.Unix(timestamp, 0)
-	log.Printf("[TIME_SYNC] Received time from Android: %s (Unix: %d)", syncTime.Format(time.RFC3339), timestamp)
+	log.Printf("[TIME_SYNC] Received time from Android: %s (Unix: %d, offset: %d min, tz: %s)",
+		syncTime.Format(time.RFC3339), timestamp, offsetMinutes, timezoneId)
 
 	// Set system time using the date command
 	// Format: date -s "@<timestamp>" sets time from Unix timestamp
@@ -1897,6 +1922,15 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 	}
 
 	log.Printf("[TIME_SYNC] ✓ System time synchronized to: %s", syncTime.Format("2006-01-02 15:04:05 MST"))
+
+	// Store timezone information in Redis for UI plugins to use
+	if c.redisStore != nil {
+		if err := c.redisStore.StoreTimezone(offsetMinutes, timezoneId); err != nil {
+			log.Printf("[TIME_SYNC] Warning: Failed to store timezone in Redis: %v", err)
+		} else {
+			log.Printf("[TIME_SYNC] ✓ Timezone stored in Redis: offset=%d min, id=%s", offsetMinutes, timezoneId)
+		}
+	}
 }
 
 // requestLyrics requests lyrics from the Android server

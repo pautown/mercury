@@ -486,6 +486,27 @@ func (s *Store) GetMediaState() (*MediaState, error) {
 	return state, nil
 }
 
+// StoreTimezone stores the phone's timezone information for UI plugins
+// offsetMinutes: timezone offset from UTC in minutes (e.g., -300 for EST)
+// timezoneId: IANA timezone ID (e.g., "America/New_York")
+func (s *Store) StoreTimezone(offsetMinutes int64, timezoneId string) error {
+	pipe := s.client.Pipeline()
+
+	if offsetKey, exists := s.keyMap["timezoneOffset"]; exists {
+		pipe.Set(s.ctx, offsetKey, fmt.Sprintf("%d", offsetMinutes), 0)
+	}
+	if idKey, exists := s.keyMap["timezoneId"]; exists {
+		pipe.Set(s.ctx, idKey, timezoneId, 0)
+	}
+
+	_, err := pipe.Exec(s.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to store timezone: %w", err)
+	}
+
+	return nil
+}
+
 // QueuePlaybackCommand queues a playback control command
 func (s *Store) QueuePlaybackCommand(cmd *PlaybackCommand) error {
 	cmd.Timestamp = time.Now().Unix()
