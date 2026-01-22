@@ -1864,7 +1864,7 @@ func (c *Client) handleSettingsNotification(buf []byte) {
 }
 
 // handleTimeSyncNotification processes time sync updates from Android
-// Sets the system time based on Unix timestamp received from the phone
+// Sets the system time and timezone based on data received from the phone
 // Format: "timestamp|offset_minutes|timezone_id" (e.g., "1737590400|-300|America/New_York")
 // Falls back to legacy format (just timestamp) for backwards compatibility
 func (c *Client) handleTimeSyncNotification(buf []byte) {
@@ -1892,7 +1892,7 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 		return
 	}
 
-	// Parse timezone offset (optional - new format)
+	// Parse timezone offset (optional)
 	if len(parts) >= 2 {
 		offsetMinutes, err = strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
@@ -1901,7 +1901,7 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 		}
 	}
 
-	// Parse timezone ID (optional - new format)
+	// Parse timezone ID (optional)
 	if len(parts) >= 3 {
 		timezoneId = parts[2]
 	}
@@ -1911,9 +1911,13 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 	log.Printf("[TIME_SYNC] Received time from Android: %s (Unix: %d, offset: %d min, tz: %s)",
 		syncTime.Format(time.RFC3339), timestamp, offsetMinutes, timezoneId)
 
-	// Set system time using the date command
-	// Format: date -s "@<timestamp>" sets time from Unix timestamp
-	cmd := fmt.Sprintf("date -s \"@%d\"", timestamp)
+	// Set system timezone first (if we have a valid IANA timezone ID)
+	if timezoneId != "" {
+		c.setSystemTimezone(timezoneId)
+	}
+
+	// Set system time using the date command (with sudo for permissions)
+	cmd := fmt.Sprintf("sudo date -s \"@%d\"", timestamp)
 	output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		log.Printf("[TIME_SYNC] Failed to set system time: %v (output: %s)", err, string(output))
@@ -1931,6 +1935,35 @@ func (c *Client) handleTimeSyncNotification(buf []byte) {
 			log.Printf("[TIME_SYNC] ✓ Timezone stored in Redis: offset=%d min, id=%s", offsetMinutes, timezoneId)
 		}
 	}
+}
+
+// setSystemTimezone sets the system timezone by linking /etc/localtime
+// to the appropriate zoneinfo file (uses sudo for write permissions)
+func (c *Client) setSystemTimezone(timezoneId string) {
+	// Validate timezone ID exists
+	zonePath := fmt.Sprintf("/usr/share/zoneinfo/%s", timezoneId)
+	if _, err := os.Stat(zonePath); os.IsNotExist(err) {
+		log.Printf("[TIME_SYNC] Timezone file not found: %s", zonePath)
+		return
+	}
+
+	// Remove existing /etc/localtime and create symlink (using sudo for permissions)
+	cmd := fmt.Sprintf("sudo rm -f /etc/localtime && sudo ln -sf %s /etc/localtime", zonePath)
+	output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		log.Printf("[TIME_SYNC] Failed to set timezone symlink: %v (output: %s)", err, string(output))
+		return
+	}
+
+	// Also write to /etc/timezone for systems that use it
+	cmd = fmt.Sprintf("echo '%s' | sudo tee /etc/timezone > /dev/null", timezoneId)
+	output, err = exec.Command("sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		log.Printf("[TIME_SYNC] Warning: Failed to write /etc/timezone: %v (output: %s)", err, string(output))
+		// Not fatal, symlink is the primary method
+	}
+
+	log.Printf("[TIME_SYNC] ✓ System timezone set to: %s", timezoneId)
 }
 
 // requestLyrics requests lyrics from the Android server
