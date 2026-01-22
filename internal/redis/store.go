@@ -1588,3 +1588,54 @@ func (s *Store) GetLyricsEnabled() (bool, error) {
 	debug.LogLyrics("Lyrics feature enabled: %v (raw value: '%s')", enabled, result)
 	return enabled, nil
 }
+
+// ============================================================================
+// Media Channels Storage Functions
+// ============================================================================
+
+// MediaChannelsResponse represents the list of media channel apps
+type MediaChannelsResponse struct {
+	Channels  []string `json:"channels"`  // List of channel names (e.g., "Spotify", "YouTube Music")
+	Count     int      `json:"count"`     // Total channel count
+	Timestamp int64    `json:"timestamp"` // When the list was fetched
+}
+
+// StoreMediaChannels stores the list of media channel apps in Redis
+func (s *Store) StoreMediaChannels(channels []string) error {
+	response := MediaChannelsResponse{
+		Channels:  channels,
+		Count:     len(channels),
+		Timestamp: time.Now().Unix(),
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal media channels: %w", err)
+	}
+
+	// Store in Redis key that SDK's LlzMediaGetChannels reads
+	if err := s.client.Set(s.ctx, "media:channels", jsonData, 0).Err(); err != nil {
+		return fmt.Errorf("failed to store media channels: %w", err)
+	}
+
+	log.Printf("[MEDIA_CHANNELS] Stored %d channels in Redis (%d bytes)", len(channels), len(jsonData))
+	return nil
+}
+
+// GetMediaChannels retrieves the list of media channel apps from Redis
+func (s *Store) GetMediaChannels() (*MediaChannelsResponse, error) {
+	result, err := s.client.Get(s.ctx, "media:channels").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil // No channels stored yet
+		}
+		return nil, fmt.Errorf("failed to get media channels: %w", err)
+	}
+
+	var response MediaChannelsResponse
+	if err := json.Unmarshal([]byte(result), &response); err != nil {
+		return nil, fmt.Errorf("failed to parse media channels: %w", err)
+	}
+
+	return &response, nil
+}

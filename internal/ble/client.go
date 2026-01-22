@@ -923,6 +923,9 @@ func (c *Client) trackError(errorType string, err error) {
 	c.lastError = err
 	c.attErrorCount[errorType]++
 
+	// Log error to persistent file
+	LogError(errorType, err)
+
 	// Check for specific ATT error 0x0e (Unlikely Error/Insufficient Resources)
 	if err != nil && strings.Contains(err.Error(), "ATT error: 0x0e") {
 		c.attErrorCount["att_0x0e"]++
@@ -1325,20 +1328,23 @@ var (
 // Data may arrive in chunks with 2-byte header: [chunkIndex, totalChunks, ...data...]
 // Podcast response types (matches Android GattServerManager header byte)
 const (
-	PodcastResponseTypeLegacy   = 0 // Legacy 2-byte header format
-	PodcastResponseTypeList     = 1 // PodcastListResponse (A-Z channel list)
-	PodcastResponseTypeRecent   = 2 // RecentEpisodesResponse (recent episodes)
-	PodcastResponseTypeEpisodes = 3 // PodcastEpisodesResponse (paginated episodes)
+	PodcastResponseTypeLegacy        = 0 // Legacy 2-byte header format
+	PodcastResponseTypeList          = 1 // PodcastListResponse (A-Z channel list)
+	PodcastResponseTypeRecent        = 2 // RecentEpisodesResponse (recent episodes)
+	PodcastResponseTypeEpisodes      = 3 // PodcastEpisodesResponse (paginated episodes)
+	MediaChannelsResponseType        = 4 // MediaChannelsResponse (list of media channel apps)
 )
 
 // State for each response type's chunk reassembly
 var (
-	podcastListChunks        = make(map[int][]byte)
-	podcastListTotalChunks   = 0
-	podcastRecentChunks      = make(map[int][]byte)
-	podcastRecentTotalChunks = 0
+	podcastListChunks          = make(map[int][]byte)
+	podcastListTotalChunks     = 0
+	podcastRecentChunks        = make(map[int][]byte)
+	podcastRecentTotalChunks   = 0
 	podcastEpisodesChunks      = make(map[int][]byte)
 	podcastEpisodesTotalChunks = 0
+	mediaChannelsChunks        = make(map[int][]byte)
+	mediaChannelsTotalChunks   = 0
 )
 
 func (c *Client) handlePodcastInfoNotification(buf []byte) {
@@ -1357,7 +1363,7 @@ func (c *Client) handlePodcastInfoNotification(buf []byte) {
 	var chunkIndex, totalChunks int
 	var chunkData []byte
 
-	if responseType >= 1 && responseType <= 3 {
+	if responseType >= 1 && responseType <= 4 {
 		// New 3-byte header format
 		chunkIndex = int(buf[1])
 		totalChunks = int(buf[2])
@@ -1430,6 +1436,8 @@ func podcastResponseTypeName(t int) string {
 		return "recent_episodes"
 	case PodcastResponseTypeEpisodes:
 		return "podcast_episodes"
+	case MediaChannelsResponseType:
+		return "media_channels"
 	default:
 		return "unknown"
 	}
@@ -1443,6 +1451,8 @@ func (c *Client) getPodcastChunkStorage(responseType int) (map[int][]byte, *int)
 		return podcastRecentChunks, &podcastRecentTotalChunks
 	case PodcastResponseTypeEpisodes:
 		return podcastEpisodesChunks, &podcastEpisodesTotalChunks
+	case MediaChannelsResponseType:
+		return mediaChannelsChunks, &mediaChannelsTotalChunks
 	default:
 		return podcastInfoChunks, &podcastInfoTotalChunks
 	}
@@ -1459,6 +1469,9 @@ func (c *Client) clearPodcastChunkStorage(responseType int) {
 	case PodcastResponseTypeEpisodes:
 		podcastEpisodesChunks = make(map[int][]byte)
 		podcastEpisodesTotalChunks = 0
+	case MediaChannelsResponseType:
+		mediaChannelsChunks = make(map[int][]byte)
+		mediaChannelsTotalChunks = 0
 	default:
 		podcastInfoChunks = make(map[int][]byte)
 		podcastInfoTotalChunks = 0
@@ -1474,6 +1487,8 @@ func (c *Client) processPodcastResponse(responseType int, data []byte) {
 		c.processRecentEpisodesJSON(data)
 	case PodcastResponseTypeEpisodes:
 		c.processPodcastEpisodesJSON(data)
+	case MediaChannelsResponseType:
+		c.processMediaChannelsBinary(data)
 	default:
 		// Legacy format - try multiple formats
 		c.processPodcastInfoJSON(data)
@@ -1575,6 +1590,62 @@ func (c *Client) processPodcastEpisodesJSON(data []byte) {
 	}
 
 	log.Printf("✅ Stored podcast episodes in Redis for '%s'", response.Name)
+}
+
+// processMediaChannelsBinary parses binary media channels list from Android
+// Binary format:
+//   - 2 bytes: uint16 big-endian channel count
+//   - For each channel:
+//     - 1 byte: name length
+//     - N bytes: UTF-8 name string
+func (c *Client) processMediaChannelsBinary(data []byte) {
+	log.Printf("📺 Processing media channels binary (%d bytes)", len(data))
+
+	if len(data) < 2 {
+		log.Printf("❌ Media channels data too short: %d bytes", len(data))
+		return
+	}
+
+	// Read channel count (big-endian uint16)
+	channelCount := int(data[0])<<8 | int(data[1])
+	log.Printf("   Channel count: %d", channelCount)
+
+	channels := make([]string, 0, channelCount)
+	offset := 2
+
+	for i := 0; i < channelCount && offset < len(data); i++ {
+		// Read name length
+		nameLen := int(data[offset])
+		offset++
+
+		if offset+nameLen > len(data) {
+			log.Printf("❌ Media channel %d name truncated (need %d bytes, have %d)", i, nameLen, len(data)-offset)
+			break
+		}
+
+		// Read name
+		name := string(data[offset : offset+nameLen])
+		offset += nameLen
+		channels = append(channels, name)
+	}
+
+	// Print the channel list
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("📺 MEDIA CHANNELS: Received %d channels from Android", len(channels))
+	log.Printf("═══════════════════════════════════════════════════════")
+	for i, ch := range channels {
+		log.Printf("   %2d. %s", i+1, ch)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreMediaChannels(channels); err != nil {
+		log.Printf("❌ Failed to store media channels: %v", err)
+		c.trackError("media_channels_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored %d media channels in Redis", len(channels))
 }
 
 // processPodcastInfoJSON parses and stores podcast info JSON (legacy format)
@@ -2170,6 +2241,7 @@ func (c *Client) validatePlaybackCommand(cmd *redis.PlaybackCommand) error {
 		"request_recent_episodes":  true, // get recent episodes across all podcasts
 		"request_podcast_episodes": true, // get episodes for specific podcast (paginated)
 		"request_lyrics":           true, // request lyrics for artist/track
+		"request_media_channels":   true, // get list of media channel apps (Spotify, YouTube, etc.)
 	}
 
 	if !validActions[cmd.Action] {
@@ -2296,6 +2368,11 @@ func (c *Client) convertToBLECommand(cmd *redis.PlaybackCommand) (*PlaybackComma
 		log.Printf("   → limit: %d", bleCmd.Limit)
 		log.Printf("   → Target: Android MediaDash via BLE")
 		log.Printf("   → Response: Will be stored in podcast:episodes:%s Redis key", cmd.PodcastId)
+	case "request_media_channels":
+		log.Printf("═══════════════════════════════════════════════════════")
+		log.Printf("📺 MEDIA: Request media channel apps list")
+		log.Printf("   → Target: Android MediaDash via BLE")
+		log.Printf("   → Response: Binary format, will be stored in media:channels Redis key")
 	}
 
 	log.Printf("Converted command: %s -> BLE{Action: %s, Value: %d, PodcastId: %s, EpisodeIndex: %d, Offset: %d, Limit: %d}",
@@ -2814,10 +2891,14 @@ func (c *Client) handleDisconnection() {
 	if wasConnected {
 		log.Printf("Device disconnected after %v", connectionDuration.Truncate(time.Second))
 
+		// Log disconnection to persistent file
+		LogDisconnect(fmt.Sprintf("connection duration: %v, consecutive errors: %d", connectionDuration.Truncate(time.Second), c.consecutiveErrors))
+
 		// Analyze disconnection pattern
 		if connectionDuration < 15*time.Second {
 			log.Printf("Short-lived connection detected (< 15s) - possible ATT error or resource issue")
 			c.consecutiveErrors++
+			LogConnectionIssue("short-lived connection detected (<15s)", nil)
 		} else {
 			c.consecutiveErrors = 0 // Reset on successful long connection
 		}
@@ -2825,6 +2906,7 @@ func (c *Client) handleDisconnection() {
 		// Update Redis with disconnection status
 		if err := c.redisStore.SetBLEConnectionStatus(false, ""); err != nil {
 			log.Printf("Warning: Failed to update Redis disconnection status: %v", err)
+			LogConnectionIssue("failed to update Redis disconnection status", err)
 		}
 
 		// Clear retry queue - old commands are stale after disconnection
@@ -3142,54 +3224,67 @@ func (c *Client) logDuplicateNotification(update *MediaStateUpdate) {
 }
 
 // handleAlbumArtHashChange handles album art hash changes separately with validation
+// If Android sends an empty hash but artist/album are available, computes the hash locally
 func (c *Client) handleAlbumArtHashChange(newHash string, artist, album string) {
+	// If Android didn't send a hash but we have artist and album, compute it ourselves
+	// This ensures we can proactively request album art for new tracks
+	effectiveHash := newHash
+	hashWasComputed := false
+	if effectiveHash == "" && artist != "" && album != "" {
+		effectiveHash = albumart.GenerateAlbumArtHash(artist, album)
+		hashWasComputed = true
+		log.Printf("BLE_AA_ADVANCED: Android sent empty hash, computed from artist|album: %s (artist='%s', album='%s')", effectiveHash, artist, album)
+	}
+
 	c.albumArtHashMutex.Lock()
 	lastHash := c.lastAlbumArtHash
-	c.lastAlbumArtHash = newHash
+	c.lastAlbumArtHash = effectiveHash
 	c.albumArtHashMutex.Unlock()
 
-	if newHash != "" && newHash != lastHash {
+	if effectiveHash != "" && effectiveHash != lastHash {
 		// Cancel any stale requests for old hashes before processing new one
 		if c.albumHandler != nil {
-			c.albumHandler.CancelStaleRequests(newHash)
+			c.albumHandler.CancelStaleRequests(effectiveHash)
 		}
 
-		// Validate the hash matches the expected artist/album combination
-		if artist != "" && album != "" {
+		// Validate the hash matches the expected artist/album combination (only if Android provided a hash)
+		if !hashWasComputed && artist != "" && album != "" {
 			expectedHash := albumart.GenerateAlbumArtHash(artist, album)
-			if newHash == expectedHash {
-				log.Printf("BLE_AA_ADVANCED: Album art hash changed: %s -> %s (✓ validated for %s|%s)", lastHash, newHash, artist, album)
+			if effectiveHash == expectedHash {
+				log.Printf("BLE_AA_ADVANCED: Album art hash changed: %s -> %s (✓ validated for %s|%s)", lastHash, effectiveHash, artist, album)
 			} else {
 				log.Printf("BLE_AA_ADVANCED: Album art hash changed: %s -> %s (⚠️ mismatch: expected %s for %s|%s)",
-					lastHash, newHash, expectedHash, artist, album)
+					lastHash, effectiveHash, expectedHash, artist, album)
 			}
+		} else if !hashWasComputed {
+			log.Printf("BLE_AA_ADVANCED: Album art hash changed: %s -> %s (waiting for proactive send)", lastHash, effectiveHash)
 		} else {
-			log.Printf("BLE_AA_ADVANCED: Album art hash changed: %s -> %s (waiting for proactive send)", lastHash, newHash)
+			log.Printf("BLE_AA_ADVANCED: Album art hash changed (computed): %s -> %s for %s|%s", lastHash, effectiveHash, artist, album)
 		}
 
 		// Check if we already have this album art cached
-		cachedData, err := c.albumHandler.GetCachedAlbumArt(newHash)
+		cachedData, err := c.albumHandler.GetCachedAlbumArt(effectiveHash)
 		if err != nil {
-			log.Printf("BLE_AA_ADVANCED: Error checking album art cache for hash %s: %v", newHash, err)
+			log.Printf("BLE_AA_ADVANCED: Error checking album art cache for hash %s: %v", effectiveHash, err)
 		} else if cachedData != nil {
-			log.Printf("BLE_AA_ADVANCED: Album art already cached for hash %s (%d bytes) - updating Redis path", newHash, len(cachedData))
-			artFilePath := filepath.Join(c.cfg.AlbumArt.CacheDirectory, newHash+".webp")
+			log.Printf("BLE_AA_ADVANCED: Album art already cached for hash %s (%d bytes) - updating Redis path", effectiveHash, len(cachedData))
+			artFilePath := filepath.Join(c.cfg.AlbumArt.CacheDirectory, effectiveHash+".webp")
 			if err := c.redisStore.SetAlbumArtFilePath(artFilePath); err != nil {
 				log.Printf("BLE_AA_ADVANCED: Failed to update Redis album art path: %v", err)
 			} else {
 				log.Printf("BLE_AA_ADVANCED: Successfully updated Redis album art path: %s", artFilePath)
 			}
 		} else {
-			log.Printf("BLE_AA_ADVANCED: Album art not cached for hash %s - requesting from Android", newHash)
+			log.Printf("BLE_AA_ADVANCED: Album art not cached for hash %s - requesting from Android", effectiveHash)
 			// Request album art from Android server
-			if err := c.requestAlbumArt(newHash); err != nil {
-				log.Printf("BLE_AA_ADVANCED: Failed to request album art for hash %s: %v", newHash, err)
+			if err := c.requestAlbumArt(effectiveHash); err != nil {
+				log.Printf("BLE_AA_ADVANCED: Failed to request album art for hash %s: %v", effectiveHash, err)
 			} else {
-				log.Printf("BLE_AA_ADVANCED: Successfully sent album art request for hash %s", newHash)
+				log.Printf("BLE_AA_ADVANCED: Successfully sent album art request for hash %s", effectiveHash)
 			}
 		}
-	} else if newHash == "" && lastHash != "" {
-		// Album art removed
+	} else if effectiveHash == "" && lastHash != "" {
+		// Album art removed (no hash and no artist/album to compute from)
 		log.Printf("BLE_AA_ADVANCED: Album art removed (was: %s)", lastHash)
 		if err := c.redisStore.ClearAlbumArtFilePath(); err != nil {
 			log.Printf("BLE_AA_ADVANCED: Failed to clear Redis album art path: %v", err)
@@ -3197,7 +3292,7 @@ func (c *Client) handleAlbumArtHashChange(newHash string, artist, album string) 
 			log.Printf("BLE_AA_ADVANCED: Successfully cleared Redis album art path")
 		}
 	}
-	// If newHash == lastHash, no change needed - don't log or clear
+	// If effectiveHash == lastHash, no change needed - don't log or clear
 }
 
 // IsConnected returns the current connection status
