@@ -367,6 +367,8 @@ type PlaybackCommand struct {
 	Offset       int    `json:"offset"`                // For pagination - no omitempty since 0 is valid
 	Limit        int    `json:"limit,omitempty"`       // For pagination (request_podcast_episodes)
 	Channel      string `json:"channel,omitempty"`     // Media channel name for select_media_channel
+	Service      string `json:"service,omitempty"`     // Service name for check_connection (e.g., "spotify")
+	QueueIndex   int    `json:"queueIndex"`            // 0-based index for queue_shift - no omitempty since 0 is valid
 }
 
 // Note: AlbumArtRequestCommand removed - Android now proactively sends album art
@@ -1336,18 +1338,24 @@ const (
 	PodcastResponseTypeRecent        = 2 // RecentEpisodesResponse (recent episodes)
 	PodcastResponseTypeEpisodes      = 3 // PodcastEpisodesResponse (paginated episodes)
 	MediaChannelsResponseType        = 4 // MediaChannelsResponse (list of media channel apps)
+	ConnectionStatusResponseType     = 5 // ConnectionStatusResponse (service connection statuses)
+	QueueResponseType                = 6 // QueueResponse (playback queue)
 )
 
 // State for each response type's chunk reassembly
 var (
-	podcastListChunks          = make(map[int][]byte)
-	podcastListTotalChunks     = 0
-	podcastRecentChunks        = make(map[int][]byte)
-	podcastRecentTotalChunks   = 0
-	podcastEpisodesChunks      = make(map[int][]byte)
-	podcastEpisodesTotalChunks = 0
-	mediaChannelsChunks        = make(map[int][]byte)
-	mediaChannelsTotalChunks   = 0
+	podcastListChunks             = make(map[int][]byte)
+	podcastListTotalChunks        = 0
+	podcastRecentChunks           = make(map[int][]byte)
+	podcastRecentTotalChunks      = 0
+	podcastEpisodesChunks         = make(map[int][]byte)
+	podcastEpisodesTotalChunks    = 0
+	mediaChannelsChunks           = make(map[int][]byte)
+	mediaChannelsTotalChunks      = 0
+	connectionStatusChunks        = make(map[int][]byte)
+	connectionStatusTotalChunks   = 0
+	queueChunks                   = make(map[int][]byte)
+	queueTotalChunks              = 0
 )
 
 func (c *Client) handlePodcastInfoNotification(buf []byte) {
@@ -1366,12 +1374,12 @@ func (c *Client) handlePodcastInfoNotification(buf []byte) {
 	var chunkIndex, totalChunks int
 	var chunkData []byte
 
-	if responseType >= 1 && responseType <= 4 {
-		// New 3-byte header format
+	if responseType >= 1 && responseType <= QueueResponseType {
+		// New 3-byte header format (types 1-6)
 		chunkIndex = int(buf[1])
 		totalChunks = int(buf[2])
 		chunkData = buf[3:]
-		log.Printf("📦 Received podcast chunk: type=%d (%s), chunk %d/%d (%d bytes)",
+		log.Printf("📦 Received chunked response: type=%d (%s), chunk %d/%d (%d bytes)",
 			responseType, podcastResponseTypeName(responseType), chunkIndex+1, totalChunks, len(chunkData))
 	} else {
 		// Legacy 2-byte header format
@@ -1441,6 +1449,10 @@ func podcastResponseTypeName(t int) string {
 		return "podcast_episodes"
 	case MediaChannelsResponseType:
 		return "media_channels"
+	case ConnectionStatusResponseType:
+		return "connection_status"
+	case QueueResponseType:
+		return "queue"
 	default:
 		return "unknown"
 	}
@@ -1456,6 +1468,10 @@ func (c *Client) getPodcastChunkStorage(responseType int) (map[int][]byte, *int)
 		return podcastEpisodesChunks, &podcastEpisodesTotalChunks
 	case MediaChannelsResponseType:
 		return mediaChannelsChunks, &mediaChannelsTotalChunks
+	case ConnectionStatusResponseType:
+		return connectionStatusChunks, &connectionStatusTotalChunks
+	case QueueResponseType:
+		return queueChunks, &queueTotalChunks
 	default:
 		return podcastInfoChunks, &podcastInfoTotalChunks
 	}
@@ -1475,6 +1491,12 @@ func (c *Client) clearPodcastChunkStorage(responseType int) {
 	case MediaChannelsResponseType:
 		mediaChannelsChunks = make(map[int][]byte)
 		mediaChannelsTotalChunks = 0
+	case ConnectionStatusResponseType:
+		connectionStatusChunks = make(map[int][]byte)
+		connectionStatusTotalChunks = 0
+	case QueueResponseType:
+		queueChunks = make(map[int][]byte)
+		queueTotalChunks = 0
 	default:
 		podcastInfoChunks = make(map[int][]byte)
 		podcastInfoTotalChunks = 0
@@ -1492,6 +1514,10 @@ func (c *Client) processPodcastResponse(responseType int, data []byte) {
 		c.processPodcastEpisodesJSON(data)
 	case MediaChannelsResponseType:
 		c.processMediaChannelsBinary(data)
+	case ConnectionStatusResponseType:
+		c.processConnectionStatusJSON(data)
+	case QueueResponseType:
+		c.processQueueJSON(data)
 	default:
 		// Legacy format - try multiple formats
 		c.processPodcastInfoJSON(data)
@@ -1649,6 +1675,97 @@ func (c *Client) processMediaChannelsBinary(data []byte) {
 	}
 
 	log.Printf("✅ Stored %d media channels in Redis", len(channels))
+}
+
+// processConnectionStatusJSON parses and stores connection status from Android
+func (c *Client) processConnectionStatusJSON(data []byte) {
+	log.Printf("🔌 Processing connection status JSON (%d bytes)", len(data))
+
+	// Expected format: {"services":{"spotify":"connected","other":"disconnected"},"timestamp":123456}
+	var response redis.ConnectionStatusResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.Printf("❌ Failed to parse connection status JSON: %v", err)
+		c.trackError("connection_status_parse", err)
+		return
+	}
+
+	if response.Timestamp == 0 {
+		response.Timestamp = time.Now().Unix()
+	}
+
+	// Print the connection statuses
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("🔌 CONNECTION STATUS: Received %d services from Android", len(response.Services))
+	log.Printf("═══════════════════════════════════════════════════════")
+	for service, status := range response.Services {
+		icon := "❓"
+		if status == "connected" {
+			icon = "✅"
+		} else if status == "disconnected" {
+			icon = "❌"
+		} else if strings.HasPrefix(status, "error:") {
+			icon = "⚠️"
+		}
+		log.Printf("   %s %s: %s", icon, service, status)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreConnectionStatus(&response); err != nil {
+		log.Printf("❌ Failed to store connection status: %v", err)
+		c.trackError("connection_status_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored connection status for %d services in Redis", len(response.Services))
+}
+
+// processQueueJSON parses and stores playback queue from Android
+func (c *Client) processQueueJSON(data []byte) {
+	log.Printf("📋 Processing queue JSON (%d bytes)", len(data))
+
+	// Expected format: {"s":"spotify","c":{...},"q":[...],"t":123456}
+	var compactResponse redis.CompactQueueResponse
+	if err := json.Unmarshal(data, &compactResponse); err != nil {
+		log.Printf("❌ Failed to parse queue JSON: %v", err)
+		c.trackError("queue_parse", err)
+		return
+	}
+
+	if compactResponse.Timestamp == 0 {
+		compactResponse.Timestamp = time.Now().UnixMilli()
+	}
+
+	// Convert to Redis format
+	redisResponse := compactResponse.ToRedisFormat()
+
+	// Print queue info
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("📋 QUEUE: Received from Android")
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("   Service: %s", redisResponse.Service)
+	if redisResponse.CurrentlyPlaying != nil {
+		log.Printf("   ▶️ Now Playing: %s - %s", redisResponse.CurrentlyPlaying.Title, redisResponse.CurrentlyPlaying.Artist)
+	}
+	log.Printf("   Queue tracks: %d", len(redisResponse.Tracks))
+	for i, track := range redisResponse.Tracks {
+		if i < 5 {
+			log.Printf("   %d. %s - %s", i+1, track.Title, track.Artist)
+		}
+	}
+	if len(redisResponse.Tracks) > 5 {
+		log.Printf("   ... and %d more", len(redisResponse.Tracks)-5)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreQueue(redisResponse); err != nil {
+		log.Printf("❌ Failed to store queue: %v", err)
+		c.trackError("queue_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored queue with %d tracks in Redis", len(redisResponse.Tracks))
 }
 
 // processPodcastInfoJSON parses and stores podcast info JSON (legacy format)
@@ -2277,6 +2394,17 @@ func (c *Client) processNextCommand() error {
 	case "request_podcast_episodes":
 		log.Printf("✅ PODCAST: Podcast episodes request sent successfully")
 		log.Printf("   → Waiting for Android response via BLE notification...")
+	case "check_connection":
+		log.Printf("✅ CONNECTIONS: Connection check request sent for service: %s", cmd.Service)
+		log.Printf("   → Waiting for Android response via BLE notification...")
+	case "check_all_connections":
+		log.Printf("✅ CONNECTIONS: All connections check request sent")
+		log.Printf("   → Waiting for Android response via BLE notification...")
+	case "request_queue":
+		log.Printf("✅ QUEUE: Queue request sent")
+		log.Printf("   → Waiting for Android response via BLE notification...")
+	case "queue_shift":
+		log.Printf("✅ QUEUE: Queue shift sent (index: %d)", cmd.QueueIndex)
 	default:
 		log.Printf("✓ Successfully sent command: %s", cmd.Action)
 	}
@@ -2313,6 +2441,10 @@ func (c *Client) validatePlaybackCommand(cmd *redis.PlaybackCommand) error {
 		"request_lyrics":           true, // request lyrics for artist/track
 		"request_media_channels":   true, // get list of media channel apps (Spotify, YouTube, etc.)
 		"select_media_channel":     true, // select which media channel app to control
+		"check_connection":         true, // check connection status for a specific service
+		"check_all_connections":    true, // check connection status for all services
+		"request_queue":            true, // get the current playback queue
+		"queue_shift":              true, // skip to a specific position in the queue
 	}
 
 	if !validActions[cmd.Action] {
@@ -2378,6 +2510,8 @@ func (c *Client) convertToBLECommand(cmd *redis.PlaybackCommand) (*PlaybackComma
 		Offset:       cmd.Offset,
 		Limit:        cmd.Limit,
 		Channel:      cmd.Channel,
+		Service:      cmd.Service,
+		QueueIndex:   cmd.QueueIndex,
 	}
 
 	// Map certain Redis commands to BLE equivalents

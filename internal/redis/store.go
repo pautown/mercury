@@ -36,7 +36,7 @@ type MediaState struct {
 
 // PlaybackCommand represents a playback control command
 type PlaybackCommand struct {
-	Action    string `json:"action"` // play, pause, next, previous, seek, volume, play_episode, request_podcast_list, request_lyrics, etc.
+	Action    string `json:"action"` // play, pause, next, previous, seek, volume, play_episode, request_podcast_list, request_lyrics, check_connection, etc.
 	Value     int64  `json:"value,omitempty"`
 	Timestamp int64  `json:"timestamp"`
 	// Podcast-specific fields for play_episode and request_podcast_episodes commands
@@ -51,6 +51,10 @@ type PlaybackCommand struct {
 	Track  string `json:"track,omitempty"`  // Track name for lyrics lookup
 	// Media channel selection
 	Channel string `json:"channel,omitempty"` // Media channel name for select_media_channel
+	// Connection status fields for check_connection
+	Service string `json:"service,omitempty"` // Service name (e.g., "spotify") for check_connection
+	// Queue fields for queue_shift command
+	QueueIndex int `json:"queueIndex,omitempty"` // 0-based index in queue for queue_shift
 }
 
 // AlbumArtRequest represents a request for album art data
@@ -1691,4 +1695,216 @@ func (s *Store) GetControlledChannel() (string, error) {
 		return "", err
 	}
 	return result, nil
+}
+
+// ============================================================================
+// Connection Status Functions
+// ============================================================================
+
+// ConnectionStatusRequest represents a request to check service connections
+type ConnectionStatusRequest struct {
+	Action    string `json:"action"`             // "check_connection" or "check_all_connections"
+	Service   string `json:"service,omitempty"`  // Service name for single check (e.g., "spotify")
+	Timestamp int64  `json:"timestamp"`
+}
+
+// ConnectionStatusResponse represents the response from Android with connection statuses
+type ConnectionStatusResponse struct {
+	Services  map[string]string `json:"services"`  // Map of service name -> status ("connected", "disconnected", "error:...")
+	Timestamp int64             `json:"timestamp"` // When the response was generated
+}
+
+// ============================================================================
+// Queue Types (for request_queue and queue_shift commands)
+// ============================================================================
+
+// CompactQueueResponse is the compact BLE format received from Android
+type CompactQueueResponse struct {
+	Service          string              `json:"s"` // Service name (e.g., "spotify")
+	CurrentlyPlaying *CompactQueueTrack  `json:"c"` // Currently playing track
+	Queue            []CompactQueueTrack `json:"q"` // Queue tracks
+	Timestamp        int64               `json:"t"` // When queue was fetched
+}
+
+// CompactQueueTrack is the compact BLE format for a queue track
+type CompactQueueTrack struct {
+	Title    string `json:"t"` // Track title
+	Artist   string `json:"a"` // Artist name
+	Album    string `json:"b"` // Album name (optional)
+	Duration int    `json:"d"` // Duration in seconds
+	URI      string `json:"u"` // Spotify URI
+}
+
+// RedisQueueResponse is the full format stored in Redis for C plugin
+type RedisQueueResponse struct {
+	Service          string            `json:"service"`
+	CurrentlyPlaying *RedisQueueTrack  `json:"currentlyPlaying"`
+	Tracks           []RedisQueueTrack `json:"tracks"`
+	Timestamp        int64             `json:"timestamp"`
+}
+
+// RedisQueueTrack is the full format for a queue track in Redis
+type RedisQueueTrack struct {
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album"`
+	Duration int64  `json:"duration"` // Duration in milliseconds
+	URI      string `json:"uri"`
+}
+
+// ToRedisFormat converts compact BLE format to full Redis format
+func (c *CompactQueueResponse) ToRedisFormat() *RedisQueueResponse {
+	var currentTrack *RedisQueueTrack
+	if c.CurrentlyPlaying != nil {
+		currentTrack = &RedisQueueTrack{
+			Title:    c.CurrentlyPlaying.Title,
+			Artist:   c.CurrentlyPlaying.Artist,
+			Album:    c.CurrentlyPlaying.Album,
+			Duration: int64(c.CurrentlyPlaying.Duration) * 1000, // Convert to ms
+			URI:      c.CurrentlyPlaying.URI,
+		}
+	}
+
+	tracks := make([]RedisQueueTrack, len(c.Queue))
+	for i, track := range c.Queue {
+		tracks[i] = RedisQueueTrack{
+			Title:    track.Title,
+			Artist:   track.Artist,
+			Album:    track.Album,
+			Duration: int64(track.Duration) * 1000, // Convert to ms
+			URI:      track.URI,
+		}
+	}
+
+	return &RedisQueueResponse{
+		Service:          c.Service,
+		CurrentlyPlaying: currentTrack,
+		Tracks:           tracks,
+		Timestamp:        c.Timestamp,
+	}
+}
+
+// DequeueConnectionStatusRequest dequeues a connection status request from Redis
+func (s *Store) DequeueConnectionStatusRequest() (*ConnectionStatusRequest, error) {
+	data, err := s.client.BRPop(s.ctx, 1*time.Second, "system:connection_status_q").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil // No requests queued
+		}
+		return nil, fmt.Errorf("failed to dequeue connection status request: %w", err)
+	}
+
+	if len(data) < 2 {
+		return nil, fmt.Errorf("invalid connection status request data received")
+	}
+
+	var req ConnectionStatusRequest
+	err = json.Unmarshal([]byte(data[1]), &req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal connection status request: %w", err)
+	}
+
+	log.Printf("[CONNECTIONS] Dequeued connection status request: action=%s, service=%s", req.Action, req.Service)
+	return &req, nil
+}
+
+// StoreConnectionStatus stores connection status for services in Redis
+func (s *Store) StoreConnectionStatus(response *ConnectionStatusResponse) error {
+	pipe := s.client.Pipeline()
+
+	// Store status for each service
+	for service, status := range response.Services {
+		key := fmt.Sprintf("connections:%s", service)
+		pipe.Set(s.ctx, key, status, 0)
+		log.Printf("[CONNECTIONS] Storing %s = %s", key, status)
+	}
+
+	// Store timestamp
+	pipe.Set(s.ctx, "connections:timestamp", fmt.Sprintf("%d", response.Timestamp), 0)
+
+	_, err := pipe.Exec(s.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to store connection status: %w", err)
+	}
+
+	log.Printf("[CONNECTIONS] Stored connection status for %d services", len(response.Services))
+	return nil
+}
+
+// GetConnectionStatus retrieves connection status for all services from Redis
+func (s *Store) GetConnectionStatus() (*ConnectionStatusResponse, error) {
+	// Get all connections:* keys
+	keys, err := s.client.Keys(s.ctx, "connections:*").Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection status keys: %w", err)
+	}
+
+	response := &ConnectionStatusResponse{
+		Services: make(map[string]string),
+	}
+
+	for _, key := range keys {
+		if key == "connections:timestamp" {
+			// Get timestamp
+			tsStr, err := s.client.Get(s.ctx, key).Result()
+			if err == nil {
+				fmt.Sscanf(tsStr, "%d", &response.Timestamp)
+			}
+			continue
+		}
+
+		// Extract service name from key (connections:spotify -> spotify)
+		service := strings.TrimPrefix(key, "connections:")
+		status, err := s.client.Get(s.ctx, key).Result()
+		if err == nil {
+			response.Services[service] = status
+		}
+	}
+
+	return response, nil
+}
+
+// ============================================================================
+// Queue Storage Functions
+// ============================================================================
+
+// StoreQueue stores the playback queue in Redis
+func (s *Store) StoreQueue(response *RedisQueueResponse) error {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal queue response: %w", err)
+	}
+
+	// Store the queue data
+	err = s.client.Set(s.ctx, "queue:data", string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store queue data: %w", err)
+	}
+
+	// Store timestamp separately for quick checks
+	err = s.client.Set(s.ctx, "queue:timestamp", fmt.Sprintf("%d", response.Timestamp), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store queue timestamp: %w", err)
+	}
+
+	log.Printf("[QUEUE] Stored queue: %d tracks, service: %s", len(response.Tracks), response.Service)
+	return nil
+}
+
+// GetQueue retrieves the playback queue from Redis
+func (s *Store) GetQueue() (*RedisQueueResponse, error) {
+	data, err := s.client.Get(s.ctx, "queue:data").Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil // No queue stored
+		}
+		return nil, fmt.Errorf("failed to get queue data: %w", err)
+	}
+
+	var response RedisQueueResponse
+	if err := json.Unmarshal([]byte(data), &response); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal queue data: %w", err)
+	}
+
+	return &response, nil
 }
