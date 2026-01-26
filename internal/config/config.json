@@ -54,6 +54,7 @@
   },
   "albumArt": {
     "cacheDirectory": "/var/mediadash/album_art_cache",
+    "previewCacheDirectory": "/var/mediadash/album_art_previews",
     "image": {
       "format": "jpg",
       "maxWidth": 200,

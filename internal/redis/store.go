@@ -55,6 +55,9 @@ type PlaybackCommand struct {
 	Service string `json:"service,omitempty"` // Service name (e.g., "spotify") for check_connection
 	// Queue fields for queue_shift command
 	QueueIndex int `json:"queueIndex,omitempty"` // 0-based index in queue for queue_shift
+	// Spotify library fields for library browsing and playback
+	Uri     string `json:"uri,omitempty"`     // Spotify URI for play_uri command (spotify:track:xxx, spotify:album:xxx, etc.)
+	TrackId string `json:"trackId,omitempty"` // Spotify track ID for like_track/unlike_track commands
 }
 
 // AlbumArtRequest represents a request for album art data
@@ -1784,6 +1787,97 @@ func (c *CompactQueueResponse) ToRedisFormat() *RedisQueueResponse {
 	}
 }
 
+// ============================================================================
+// Spotify Library Types (for library browsing via BLE)
+// ============================================================================
+
+// SpotifyPlaybackState represents Spotify-specific playback state (shuffle/repeat/liked)
+type SpotifyPlaybackState struct {
+	Shuffle   bool   `json:"sh"`           // Shuffle enabled
+	Repeat    string `json:"rp"`           // "off", "track", "context"
+	Liked     bool   `json:"lk"`           // Current track is liked/saved
+	TrackId   string `json:"ti,omitempty"` // Spotify track ID
+	Timestamp int64  `json:"t"`            // When state was fetched
+}
+
+// SpotifyLibraryOverview represents user's Spotify library summary
+type SpotifyLibraryOverview struct {
+	UserName       string `json:"u"`            // User display name
+	LikedCount     int    `json:"lt"`           // Total liked tracks
+	AlbumsCount    int    `json:"al"`           // Total saved albums
+	PlaylistsCount int    `json:"pl"`           // Total playlists
+	ArtistsCount   int    `json:"ar"`           // Followed artists
+	CurrentTrack   string `json:"ct,omitempty"` // Currently playing track name
+	CurrentArtist  string `json:"ca,omitempty"` // Currently playing artist
+	IsPremium      bool   `json:"pr"`           // Premium account
+	Timestamp      int64  `json:"t"`            // When overview was fetched
+}
+
+// SpotifyTrackItem represents a track in library lists
+type SpotifyTrackItem struct {
+	Id         string `json:"i"`            // Spotify track ID
+	Name       string `json:"n"`            // Track title
+	Artist     string `json:"a"`            // Primary artist
+	Album      string `json:"al,omitempty"` // Album name
+	DurationMs int64  `json:"d"`            // Duration in milliseconds
+	Uri        string `json:"u"`            // Spotify URI for playback
+	ImageUrl   string `json:"im,omitempty"` // Album art URL
+}
+
+// SpotifyTrackListResponse represents a paginated track list
+type SpotifyTrackListResponse struct {
+	Type      string             `json:"ty"` // "recent" or "liked"
+	Items     []SpotifyTrackItem `json:"it"`
+	Offset    int                `json:"o"`
+	Limit     int                `json:"l"`
+	Total     int                `json:"tt"`
+	HasMore   bool               `json:"hm"`
+	Timestamp int64              `json:"t"`
+}
+
+// SpotifyAlbumItem represents a saved album
+type SpotifyAlbumItem struct {
+	Id         string `json:"i"`            // Spotify album ID
+	Name       string `json:"n"`            // Album title
+	Artist     string `json:"a"`            // Primary artist
+	TrackCount int    `json:"tc"`           // Number of tracks
+	Uri        string `json:"u"`            // Spotify URI
+	ImageUrl   string `json:"im,omitempty"` // Cover art URL
+	Year       string `json:"y,omitempty"`  // Release year
+	ArtHash    string `json:"h,omitempty"`  // Album art hash for art requests
+}
+
+// SpotifyAlbumListResponse represents a paginated album list
+type SpotifyAlbumListResponse struct {
+	Items     []SpotifyAlbumItem `json:"it"`
+	Offset    int                `json:"o"`
+	Limit     int                `json:"l"`
+	Total     int                `json:"tt"`
+	HasMore   bool               `json:"hm"`
+	Timestamp int64              `json:"t"`
+}
+
+// SpotifyPlaylistItem represents a playlist
+type SpotifyPlaylistItem struct {
+	Id         string `json:"i"`            // Spotify playlist ID
+	Name       string `json:"n"`            // Playlist name
+	Owner      string `json:"o,omitempty"`  // Owner display name
+	TrackCount int    `json:"tc"`           // Number of tracks
+	Uri        string `json:"u"`            // Spotify URI
+	ImageUrl   string `json:"im,omitempty"` // Cover art URL
+	IsPublic   bool   `json:"pu,omitempty"` // Public playlist
+}
+
+// SpotifyPlaylistListResponse represents a paginated playlist list
+type SpotifyPlaylistListResponse struct {
+	Items     []SpotifyPlaylistItem `json:"it"`
+	Offset    int                   `json:"o"`
+	Limit     int                   `json:"l"`
+	Total     int                   `json:"tt"`
+	HasMore   bool                  `json:"hm"`
+	Timestamp int64                 `json:"t"`
+}
+
 // DequeueConnectionStatusRequest dequeues a connection status request from Redis
 func (s *Store) DequeueConnectionStatusRequest() (*ConnectionStatusRequest, error) {
 	data, err := s.client.BRPop(s.ctx, 1*time.Second, "system:connection_status_q").Result()
@@ -1907,4 +2001,103 @@ func (s *Store) GetQueue() (*RedisQueueResponse, error) {
 	}
 
 	return &response, nil
+}
+
+// ============================================================================
+// Spotify Library Storage Functions
+// ============================================================================
+
+// StoreSpotifyState stores Spotify playback state (shuffle/repeat/liked) in Redis
+func (s *Store) StoreSpotifyState(state *SpotifyPlaybackState) error {
+	pipe := s.client.Pipeline()
+
+	// Store individual state keys for easy access by C plugins
+	pipe.Set(s.ctx, "spotify:shuffle", fmt.Sprintf("%t", state.Shuffle), 0)
+	pipe.Set(s.ctx, "spotify:repeat", state.Repeat, 0)
+	pipe.Set(s.ctx, "spotify:liked", fmt.Sprintf("%t", state.Liked), 0)
+	if state.TrackId != "" {
+		pipe.Set(s.ctx, "spotify:track_id", state.TrackId, 0)
+	}
+	pipe.Set(s.ctx, "spotify:state_timestamp", fmt.Sprintf("%d", state.Timestamp), 0)
+
+	// Also store as JSON blob for complete access
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify state: %w", err)
+	}
+	pipe.Set(s.ctx, "spotify:state", string(data), 0)
+
+	_, err = pipe.Exec(s.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify state: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored state: shuffle=%v, repeat=%s, liked=%v", state.Shuffle, state.Repeat, state.Liked)
+	return nil
+}
+
+// StoreSpotifyLibraryOverview stores library overview stats in Redis
+func (s *Store) StoreSpotifyLibraryOverview(overview *SpotifyLibraryOverview) error {
+	data, err := json.Marshal(overview)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify library overview: %w", err)
+	}
+
+	err = s.client.Set(s.ctx, "spotify:library:overview", string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify library overview: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored library overview for user: %s", overview.UserName)
+	return nil
+}
+
+// StoreSpotifyTrackList stores a track list (recent/liked) in Redis
+func (s *Store) StoreSpotifyTrackList(response *SpotifyTrackListResponse) error {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify track list: %w", err)
+	}
+
+	// Use type-specific key
+	key := fmt.Sprintf("spotify:library:%s", response.Type)
+	err = s.client.Set(s.ctx, key, string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify track list: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored %s track list: %d tracks (total: %d)", response.Type, len(response.Items), response.Total)
+	return nil
+}
+
+// StoreSpotifyAlbumList stores saved albums list in Redis
+func (s *Store) StoreSpotifyAlbumList(response *SpotifyAlbumListResponse) error {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify album list: %w", err)
+	}
+
+	err = s.client.Set(s.ctx, "spotify:library:albums", string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify album list: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored album list: %d albums (total: %d)", len(response.Items), response.Total)
+	return nil
+}
+
+// StoreSpotifyPlaylistList stores playlists list in Redis
+func (s *Store) StoreSpotifyPlaylistList(response *SpotifyPlaylistListResponse) error {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify playlist list: %w", err)
+	}
+
+	err = s.client.Set(s.ctx, "spotify:library:playlists", string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify playlist list: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored playlist list: %d playlists (total: %d)", len(response.Items), response.Total)
+	return nil
 }

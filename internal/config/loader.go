@@ -37,7 +37,8 @@ type Config struct {
 		KeyMap  map[string]string `json:"keyMap"`
 	} `json:"redis"`
 	AlbumArt struct {
-		CacheDirectory string `json:"cacheDirectory"`
+		CacheDirectory        string `json:"cacheDirectory"`
+		PreviewCacheDirectory string `json:"previewCacheDirectory"`
 	} `json:"albumArt"`
 }
 

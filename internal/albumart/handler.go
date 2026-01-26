@@ -140,21 +140,31 @@ type TransferState struct {
 
 // Handler manages album art transfers and caching
 type Handler struct {
-	cacheDir   string
-	transfers  map[string]*TransferState
-	mutex      sync.RWMutex
-	onComplete func(hash string, data []byte) error // Returns error for cache coherence tracking
-	validator  *Validator
-	retryMgr   *RetryManager
-	migration  *CacheMigration
+	cacheDir        string
+	previewCacheDir string
+	transfers       map[string]*TransferState
+	libraryHashes   map[string]bool // Tracks which hashes are library album art (smaller previews)
+	mutex           sync.RWMutex
+	onComplete      func(hash string, data []byte, isLibraryArt bool) error // Returns error for cache coherence tracking
+	validator       *Validator
+	retryMgr        *RetryManager
+	migration       *CacheMigration
 }
 
 // NewHandler creates a new album art handler with comprehensive validation and retry logic
 // The onComplete callback is called synchronously to ensure cache coherence between disk and Redis
-func NewHandler(cacheDir string, onComplete func(string, []byte) error) (*Handler, error) {
+// The callback receives (hash, data, isLibraryArt) where isLibraryArt indicates if this is a library album preview
+func NewHandler(cacheDir string, previewCacheDir string, onComplete func(string, []byte, bool) error) (*Handler, error) {
 	// Create cache directory if it doesn't exist
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	// Create preview cache directory if specified
+	if previewCacheDir != "" {
+		if err := os.MkdirAll(previewCacheDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create preview cache directory: %w", err)
+		}
 	}
 
 	// Initialize validator with secure defaults
@@ -164,11 +174,13 @@ func NewHandler(cacheDir string, onComplete func(string, []byte) error) (*Handle
 	migration := NewCacheMigration(cacheDir)
 
 	handler := &Handler{
-		cacheDir:   cacheDir,
-		transfers:  make(map[string]*TransferState),
-		onComplete: onComplete,
-		validator:  validator,
-		migration:  migration,
+		cacheDir:        cacheDir,
+		previewCacheDir: previewCacheDir,
+		transfers:       make(map[string]*TransferState),
+		libraryHashes:   make(map[string]bool),
+		onComplete:      onComplete,
+		validator:       validator,
+		migration:       migration,
 	}
 
 	// Initialize retry manager (will be set by SetRequestFunc)
@@ -180,6 +192,10 @@ func NewHandler(cacheDir string, onComplete func(string, []byte) error) (*Handle
 	}
 
 	log.Printf("Album art handler initialized with security validation and retry logic")
+	log.Printf("  Main cache: %s", cacheDir)
+	if previewCacheDir != "" {
+		log.Printf("  Preview cache: %s", previewCacheDir)
+	}
 	return handler, nil
 }
 
@@ -409,6 +425,15 @@ func (h *Handler) completeTransfer(transfer *TransferState) error {
 
 	data := buffer.Bytes()
 
+	// Check if this is library album art (smaller preview)
+	isLibraryArt := h.libraryHashes[transfer.Hash]
+	artType := "now-playing"
+	targetDir := h.cacheDir
+	if isLibraryArt && h.previewCacheDir != "" {
+		artType = "library-preview"
+		targetDir = h.previewCacheDir
+	}
+
 	// Comprehensive validation of complete image
 	if err := h.validator.ValidateCompleteImage(transfer.Hash, data); err != nil {
 		log.Printf("BLE_AA_ADVANCED: Complete image validation failed for hash %s: %v", transfer.Hash, err)
@@ -424,15 +449,15 @@ func (h *Handler) completeTransfer(transfer *TransferState) error {
 	}
 
 	duration := time.Since(transfer.StartTime)
-	log.Printf("BLE_AA_ADVANCED: Successfully completed album art transfer for hash %s (%d bytes in %v)",
-		transfer.Hash, len(data), duration)
+	log.Printf("BLE_AA_ADVANCED: Successfully completed %s album art transfer for hash %s (%d bytes in %v)",
+		artType, transfer.Hash, len(data), duration)
 
-	// Cache to disk with validation
-	if err := h.cacheAlbumArt(transfer.Hash, data); err != nil {
+	// Cache to disk with validation (use appropriate directory)
+	if err := h.cacheAlbumArtToDir(transfer.Hash, data, targetDir); err != nil {
 		log.Printf("BLE_AA_ADVANCED: Failed to cache album art for hash %s: %v", transfer.Hash, err)
 		// Don't fail the entire transfer for caching errors
 	} else {
-		log.Printf("BLE_AA_ADVANCED: Successfully cached album art for hash %s", transfer.Hash)
+		log.Printf("BLE_AA_ADVANCED: Successfully cached %s album art for hash %s to %s", artType, transfer.Hash, targetDir)
 	}
 
 	// Notify retry manager of successful completion
@@ -444,7 +469,7 @@ func (h *Handler) completeTransfer(transfer *TransferState) error {
 	// This guarantees that Redis is updated before we consider the transfer complete.
 	// If Redis update fails, the disk file still exists and will be picked up on cache hit.
 	if h.onComplete != nil {
-		if err := h.onComplete(transfer.Hash, data); err != nil {
+		if err := h.onComplete(transfer.Hash, data, isLibraryArt); err != nil {
 			// Log error but don't fail the transfer - disk cache is valid
 			// Redis will be updated on next cache hit via handleAlbumArtHashChange
 			log.Printf("BLE_AA_ADVANCED: Warning: onComplete callback failed for hash %s: %v (disk cache is valid)", transfer.Hash, err)
@@ -453,6 +478,11 @@ func (h *Handler) completeTransfer(transfer *TransferState) error {
 
 	// Clean up transfer state
 	delete(h.transfers, transfer.Hash)
+
+	// Clean up library hash if this was library art (one-time use)
+	if isLibraryArt {
+		delete(h.libraryHashes, transfer.Hash)
+	}
 
 	return nil
 }
@@ -487,15 +517,20 @@ func (h *Handler) GetCachedAlbumArt(hash string) ([]byte, error) {
 	return data, nil
 }
 
-// cacheAlbumArt stores album art to disk cache with validation
+// cacheAlbumArt stores album art to the main cache directory
 func (h *Handler) cacheAlbumArt(hash string, data []byte) error {
+	return h.cacheAlbumArtToDir(hash, data, h.cacheDir)
+}
+
+// cacheAlbumArtToDir stores album art to a specific cache directory with validation
+func (h *Handler) cacheAlbumArtToDir(hash string, data []byte, targetDir string) error {
 	// Sanitize hash for filesystem safety
 	sanitizedHash, err := h.validator.SanitizeHash(hash)
 	if err != nil {
 		return fmt.Errorf("invalid hash format: %w", err)
 	}
 
-	cachePath := filepath.Join(h.cacheDir, sanitizedHash+".webp")
+	cachePath := filepath.Join(targetDir, sanitizedHash+".webp")
 
 	// Write with secure permissions
 	err = os.WriteFile(cachePath, data, 0644)
@@ -550,6 +585,46 @@ func (h *Handler) GetTransferStatus(hash string) (received int, total int, compl
 	}
 
 	return received, int(transfer.TotalChunks), transfer.Complete
+}
+
+// RegisterLibraryHashes marks a set of hashes as library album art (smaller previews)
+// These will be cached to the preview directory instead of the main cache
+func (h *Handler) RegisterLibraryHashes(hashes []string) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	for _, hash := range hashes {
+		h.libraryHashes[hash] = true
+	}
+
+	log.Printf("BLE_AA_LIBRARY: Registered %d library art hashes", len(hashes))
+}
+
+// IsLibraryHash checks if a hash is registered as library album art
+func (h *Handler) IsLibraryHash(hash string) bool {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	return h.libraryHashes[hash]
+}
+
+// ClearLibraryHashes clears all registered library hashes
+func (h *Handler) ClearLibraryHashes() {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	h.libraryHashes = make(map[string]bool)
+	log.Printf("BLE_AA_LIBRARY: Cleared library art hashes")
+}
+
+// GetPreviewCacheDir returns the preview cache directory path
+func (h *Handler) GetPreviewCacheDir() string {
+	return h.previewCacheDir
+}
+
+// GetCacheDir returns the main cache directory path
+func (h *Handler) GetCacheDir() string {
+	return h.cacheDir
 }
 
 // CreateChunks splits album art data into chunks for transmission (now base64 encoded)

@@ -369,6 +369,9 @@ type PlaybackCommand struct {
 	Channel      string `json:"channel,omitempty"`     // Media channel name for select_media_channel
 	Service      string `json:"service,omitempty"`     // Service name for check_connection (e.g., "spotify")
 	QueueIndex   int    `json:"queueIndex"`            // 0-based index for queue_shift - no omitempty since 0 is valid
+	// Spotify library fields
+	Uri     string `json:"uri,omitempty"`     // Spotify URI for play_uri (spotify:track:xxx, spotify:album:xxx, etc.)
+	TrackId string `json:"trackId,omitempty"` // Spotify track ID for like_track/unlike_track
 }
 
 // Note: AlbumArtRequestCommand removed - Android now proactively sends album art
@@ -386,26 +389,37 @@ func NewClient(cfg config.Config, store *redis.Store) (*Client, error) {
 
 	// Initialize album art handler with comprehensive validation and retry logic
 	// Callback is called SYNCHRONOUSLY to ensure cache coherence between disk and Redis
-	albumHandler, err := albumart.NewHandler(cfg.AlbumArt.CacheDirectory, func(hash string, data []byte) error {
-		var lastErr error
+	// isLibraryArt indicates if this is a library album preview (smaller size, stored separately)
+	albumHandler, err := albumart.NewHandler(
+		cfg.AlbumArt.CacheDirectory,
+		cfg.AlbumArt.PreviewCacheDirectory,
+		func(hash string, data []byte, isLibraryArt bool) error {
+			var lastErr error
 
-		// Cache album art in Redis when transfer completes
-		if err := store.StoreAlbumArtCache(hash, data); err != nil {
-			log.Printf("Failed to cache album art in Redis: %v", err)
-			lastErr = err
-		}
+			// Cache album art in Redis when transfer completes
+			if err := store.StoreAlbumArtCache(hash, data); err != nil {
+				log.Printf("Failed to cache album art in Redis: %v", err)
+				lastErr = err
+			}
 
-		// Update Redis with album art file path for LVGL UI
-		artFilePath := filepath.Join(cfg.AlbumArt.CacheDirectory, hash+".webp")
-		if err := store.SetAlbumArtFilePath(artFilePath); err != nil {
-			log.Printf("Failed to update Redis album art path: %v", err)
-			lastErr = err
-		} else {
-			log.Printf("Updated Redis album art path: %s", artFilePath)
-		}
+			// Update Redis with album art file path for LVGL UI
+			// Use appropriate directory based on art type
+			var artFilePath string
+			if isLibraryArt && cfg.AlbumArt.PreviewCacheDirectory != "" {
+				artFilePath = filepath.Join(cfg.AlbumArt.PreviewCacheDirectory, hash+".webp")
+				log.Printf("📚 Library album art saved: %s", artFilePath)
+			} else {
+				artFilePath = filepath.Join(cfg.AlbumArt.CacheDirectory, hash+".webp")
+				if err := store.SetAlbumArtFilePath(artFilePath); err != nil {
+					log.Printf("Failed to update Redis album art path: %v", err)
+					lastErr = err
+				} else {
+					log.Printf("Updated Redis album art path: %s", artFilePath)
+				}
+			}
 
-		return lastErr // Return last error for logging; disk cache is still valid
-	})
+			return lastErr // Return last error for logging; disk cache is still valid
+		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create album art handler: %w", err)
 	}
@@ -1333,13 +1347,19 @@ var (
 // Data may arrive in chunks with 2-byte header: [chunkIndex, totalChunks, ...data...]
 // Podcast response types (matches Android GattServerManager header byte)
 const (
-	PodcastResponseTypeLegacy        = 0 // Legacy 2-byte header format
-	PodcastResponseTypeList          = 1 // PodcastListResponse (A-Z channel list)
-	PodcastResponseTypeRecent        = 2 // RecentEpisodesResponse (recent episodes)
-	PodcastResponseTypeEpisodes      = 3 // PodcastEpisodesResponse (paginated episodes)
-	MediaChannelsResponseType        = 4 // MediaChannelsResponse (list of media channel apps)
-	ConnectionStatusResponseType     = 5 // ConnectionStatusResponse (service connection statuses)
-	QueueResponseType                = 6 // QueueResponse (playback queue)
+	PodcastResponseTypeLegacy        = 0  // Legacy 2-byte header format
+	PodcastResponseTypeList          = 1  // PodcastListResponse (A-Z channel list)
+	PodcastResponseTypeRecent        = 2  // RecentEpisodesResponse (recent episodes)
+	PodcastResponseTypeEpisodes      = 3  // PodcastEpisodesResponse (paginated episodes)
+	MediaChannelsResponseType        = 4  // MediaChannelsResponse (list of media channel apps)
+	ConnectionStatusResponseType     = 5  // ConnectionStatusResponse (service connection statuses)
+	QueueResponseType                = 6  // QueueResponse (playback queue)
+	SpotifyStateResponseType         = 7  // SpotifyPlaybackState (shuffle/repeat/liked state)
+	SpotifyLibraryOverviewType       = 8  // SpotifyLibraryOverview (library stats)
+	SpotifyTrackListType             = 9  // SpotifyTrackListResponse (recent/liked tracks)
+	SpotifyAlbumListType             = 10 // SpotifyAlbumListResponse (saved albums)
+	SpotifyPlaylistListType          = 11 // SpotifyPlaylistListResponse (playlists)
+	MaxResponseType                  = 11 // Highest valid response type
 )
 
 // State for each response type's chunk reassembly
@@ -1356,6 +1376,16 @@ var (
 	connectionStatusTotalChunks   = 0
 	queueChunks                   = make(map[int][]byte)
 	queueTotalChunks              = 0
+	spotifyStateChunks            = make(map[int][]byte)
+	spotifyStateTotalChunks       = 0
+	spotifyOverviewChunks         = make(map[int][]byte)
+	spotifyOverviewTotalChunks    = 0
+	spotifyTrackListChunks        = make(map[int][]byte)
+	spotifyTrackListTotalChunks   = 0
+	spotifyAlbumListChunks        = make(map[int][]byte)
+	spotifyAlbumListTotalChunks   = 0
+	spotifyPlaylistListChunks     = make(map[int][]byte)
+	spotifyPlaylistListTotalChunks = 0
 )
 
 func (c *Client) handlePodcastInfoNotification(buf []byte) {
@@ -1374,8 +1404,8 @@ func (c *Client) handlePodcastInfoNotification(buf []byte) {
 	var chunkIndex, totalChunks int
 	var chunkData []byte
 
-	if responseType >= 1 && responseType <= QueueResponseType {
-		// New 3-byte header format (types 1-6)
+	if responseType >= 1 && responseType <= MaxResponseType {
+		// New 3-byte header format (types 1-11)
 		chunkIndex = int(buf[1])
 		totalChunks = int(buf[2])
 		chunkData = buf[3:]
@@ -1453,6 +1483,16 @@ func podcastResponseTypeName(t int) string {
 		return "connection_status"
 	case QueueResponseType:
 		return "queue"
+	case SpotifyStateResponseType:
+		return "spotify_state"
+	case SpotifyLibraryOverviewType:
+		return "spotify_library_overview"
+	case SpotifyTrackListType:
+		return "spotify_track_list"
+	case SpotifyAlbumListType:
+		return "spotify_album_list"
+	case SpotifyPlaylistListType:
+		return "spotify_playlist_list"
 	default:
 		return "unknown"
 	}
@@ -1472,6 +1512,16 @@ func (c *Client) getPodcastChunkStorage(responseType int) (map[int][]byte, *int)
 		return connectionStatusChunks, &connectionStatusTotalChunks
 	case QueueResponseType:
 		return queueChunks, &queueTotalChunks
+	case SpotifyStateResponseType:
+		return spotifyStateChunks, &spotifyStateTotalChunks
+	case SpotifyLibraryOverviewType:
+		return spotifyOverviewChunks, &spotifyOverviewTotalChunks
+	case SpotifyTrackListType:
+		return spotifyTrackListChunks, &spotifyTrackListTotalChunks
+	case SpotifyAlbumListType:
+		return spotifyAlbumListChunks, &spotifyAlbumListTotalChunks
+	case SpotifyPlaylistListType:
+		return spotifyPlaylistListChunks, &spotifyPlaylistListTotalChunks
 	default:
 		return podcastInfoChunks, &podcastInfoTotalChunks
 	}
@@ -1497,6 +1547,21 @@ func (c *Client) clearPodcastChunkStorage(responseType int) {
 	case QueueResponseType:
 		queueChunks = make(map[int][]byte)
 		queueTotalChunks = 0
+	case SpotifyStateResponseType:
+		spotifyStateChunks = make(map[int][]byte)
+		spotifyStateTotalChunks = 0
+	case SpotifyLibraryOverviewType:
+		spotifyOverviewChunks = make(map[int][]byte)
+		spotifyOverviewTotalChunks = 0
+	case SpotifyTrackListType:
+		spotifyTrackListChunks = make(map[int][]byte)
+		spotifyTrackListTotalChunks = 0
+	case SpotifyAlbumListType:
+		spotifyAlbumListChunks = make(map[int][]byte)
+		spotifyAlbumListTotalChunks = 0
+	case SpotifyPlaylistListType:
+		spotifyPlaylistListChunks = make(map[int][]byte)
+		spotifyPlaylistListTotalChunks = 0
 	default:
 		podcastInfoChunks = make(map[int][]byte)
 		podcastInfoTotalChunks = 0
@@ -1518,6 +1583,16 @@ func (c *Client) processPodcastResponse(responseType int, data []byte) {
 		c.processConnectionStatusJSON(data)
 	case QueueResponseType:
 		c.processQueueJSON(data)
+	case SpotifyStateResponseType:
+		c.processSpotifyStateJSON(data)
+	case SpotifyLibraryOverviewType:
+		c.processSpotifyLibraryOverviewJSON(data)
+	case SpotifyTrackListType:
+		c.processSpotifyTrackListJSON(data)
+	case SpotifyAlbumListType:
+		c.processSpotifyAlbumListJSON(data)
+	case SpotifyPlaylistListType:
+		c.processSpotifyPlaylistListJSON(data)
 	default:
 		// Legacy format - try multiple formats
 		c.processPodcastInfoJSON(data)
@@ -1766,6 +1841,186 @@ func (c *Client) processQueueJSON(data []byte) {
 	}
 
 	log.Printf("✅ Stored queue with %d tracks in Redis", len(redisResponse.Tracks))
+}
+
+// processSpotifyStateJSON handles Spotify playback state (shuffle/repeat/liked)
+func (c *Client) processSpotifyStateJSON(data []byte) {
+	log.Printf("🎵 Processing Spotify state JSON (%d bytes)", len(data))
+
+	var state redis.SpotifyPlaybackState
+	if err := json.Unmarshal(data, &state); err != nil {
+		log.Printf("❌ Failed to parse Spotify state: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_state_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("🎵 SPOTIFY STATE: Received from Android")
+	log.Printf("   Shuffle: %v, Repeat: %s, Liked: %v", state.Shuffle, state.Repeat, state.Liked)
+	log.Printf("   Track ID: %s", state.TrackId)
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyState(&state); err != nil {
+		log.Printf("❌ Failed to store Spotify state: %v", err)
+		c.trackError("spotify_state_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify state in Redis")
+}
+
+// processSpotifyLibraryOverviewJSON handles library overview stats
+func (c *Client) processSpotifyLibraryOverviewJSON(data []byte) {
+	log.Printf("📚 Processing Spotify library overview JSON (%d bytes)", len(data))
+
+	var overview redis.SpotifyLibraryOverview
+	if err := json.Unmarshal(data, &overview); err != nil {
+		log.Printf("❌ Failed to parse Spotify library overview: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_overview_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("📚 SPOTIFY LIBRARY OVERVIEW: Received from Android")
+	log.Printf("   User: %s (Premium: %v)", overview.UserName, overview.IsPremium)
+	log.Printf("   Liked: %d, Albums: %d, Playlists: %d, Artists: %d",
+		overview.LikedCount, overview.AlbumsCount, overview.PlaylistsCount, overview.ArtistsCount)
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyLibraryOverview(&overview); err != nil {
+		log.Printf("❌ Failed to store Spotify library overview: %v", err)
+		c.trackError("spotify_overview_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify library overview in Redis")
+}
+
+// processSpotifyTrackListJSON handles track list (recent/liked tracks)
+func (c *Client) processSpotifyTrackListJSON(data []byte) {
+	log.Printf("🎶 Processing Spotify track list JSON (%d bytes)", len(data))
+
+	var response redis.SpotifyTrackListResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.Printf("❌ Failed to parse Spotify track list: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_tracks_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("🎶 SPOTIFY TRACK LIST: Received from Android")
+	log.Printf("   Type: %s, Tracks: %d (total: %d, hasMore: %v)",
+		response.Type, len(response.Items), response.Total, response.HasMore)
+	for i, track := range response.Items {
+		if i < 3 {
+			log.Printf("   %d. %s - %s", i+1, track.Name, track.Artist)
+		}
+	}
+	if len(response.Items) > 3 {
+		log.Printf("   ... and %d more", len(response.Items)-3)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyTrackList(&response); err != nil {
+		log.Printf("❌ Failed to store Spotify track list: %v", err)
+		c.trackError("spotify_tracks_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify track list in Redis")
+}
+
+// processSpotifyAlbumListJSON handles saved albums list
+func (c *Client) processSpotifyAlbumListJSON(data []byte) {
+	log.Printf("💿 Processing Spotify album list JSON (%d bytes)", len(data))
+
+	var response redis.SpotifyAlbumListResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.Printf("❌ Failed to parse Spotify album list: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_albums_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("💿 SPOTIFY ALBUM LIST: Received from Android")
+	log.Printf("   Albums: %d (offset: %d, total: %d, hasMore: %v)",
+		len(response.Items), response.Offset, response.Total, response.HasMore)
+	for i, album := range response.Items {
+		if i < 5 {
+			log.Printf("   %d. %s - %s (%d tracks, hash: %s)",
+				i+1, album.Name, album.Artist, album.TrackCount, album.ArtHash)
+		}
+	}
+	if len(response.Items) > 5 {
+		log.Printf("   ... and %d more", len(response.Items)-5)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Register library art hashes with the album art handler
+	// These will be saved to the preview folder instead of the main cache
+	var libraryHashes []string
+	for _, album := range response.Items {
+		if album.ArtHash != "" {
+			libraryHashes = append(libraryHashes, album.ArtHash)
+		}
+	}
+	if len(libraryHashes) > 0 {
+		c.albumHandler.RegisterLibraryHashes(libraryHashes)
+		log.Printf("📚 Registered %d library album art hashes for preview caching", len(libraryHashes))
+	}
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyAlbumList(&response); err != nil {
+		log.Printf("❌ Failed to store Spotify album list: %v", err)
+		c.trackError("spotify_albums_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify album list in Redis")
+}
+
+// processSpotifyPlaylistListJSON handles playlists list
+func (c *Client) processSpotifyPlaylistListJSON(data []byte) {
+	log.Printf("📋 Processing Spotify playlist list JSON (%d bytes)", len(data))
+
+	var response redis.SpotifyPlaylistListResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.Printf("❌ Failed to parse Spotify playlist list: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_playlists_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("📋 SPOTIFY PLAYLIST LIST: Received from Android")
+	log.Printf("   Playlists: %d (offset: %d, total: %d, hasMore: %v)",
+		len(response.Items), response.Offset, response.Total, response.HasMore)
+	for i, playlist := range response.Items {
+		if i < 5 {
+			log.Printf("   %d. %s by %s (%d tracks)",
+				i+1, playlist.Name, playlist.Owner, playlist.TrackCount)
+		}
+	}
+	if len(response.Items) > 5 {
+		log.Printf("   ... and %d more", len(response.Items)-5)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyPlaylistList(&response); err != nil {
+		log.Printf("❌ Failed to store Spotify playlist list: %v", err)
+		c.trackError("spotify_playlists_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify playlist list in Redis")
 }
 
 // processPodcastInfoJSON parses and stores podcast info JSON (legacy format)
@@ -2445,6 +2700,22 @@ func (c *Client) validatePlaybackCommand(cmd *redis.PlaybackCommand) error {
 		"check_all_connections":    true, // check connection status for all services
 		"request_queue":            true, // get the current playback queue
 		"queue_shift":              true, // skip to a specific position in the queue
+		// Spotify playback controls
+		"shuffle_on":            true, // enable shuffle
+		"shuffle_off":           true, // disable shuffle
+		"repeat_off":            true, // disable repeat
+		"repeat_track":          true, // repeat current track
+		"repeat_context":        true, // repeat current playlist/album
+		"like_track":            true, // save track to library
+		"unlike_track":          true, // remove track from library
+		"request_spotify_state": true, // get shuffle/repeat/liked state
+		// Spotify library browsing
+		"library_overview":  true, // get library overview stats
+		"library_recent":    true, // get recently played tracks
+		"library_liked":     true, // get liked/saved tracks
+		"library_albums":    true, // get saved albums
+		"library_playlists": true, // get user playlists
+		"play_uri":          true, // play a Spotify URI (track, album, playlist)
 	}
 
 	if !validActions[cmd.Action] {
@@ -2512,6 +2783,8 @@ func (c *Client) convertToBLECommand(cmd *redis.PlaybackCommand) (*PlaybackComma
 		Channel:      cmd.Channel,
 		Service:      cmd.Service,
 		QueueIndex:   cmd.QueueIndex,
+		Uri:          cmd.Uri,
+		TrackId:      cmd.TrackId,
 	}
 
 	// Map certain Redis commands to BLE equivalents
