@@ -1878,6 +1878,26 @@ type SpotifyPlaylistListResponse struct {
 	Timestamp int64                 `json:"t"`
 }
 
+// SpotifyArtistItem represents a followed artist
+type SpotifyArtistItem struct {
+	Id        string   `json:"i"`            // Spotify artist ID
+	Name      string   `json:"n"`            // Artist name
+	Genres    []string `json:"g,omitempty"`  // Up to 3 genres
+	Followers int      `json:"f,omitempty"`  // Follower count
+	Uri       string   `json:"u"`            // Spotify URI
+	ImageUrl  string   `json:"im,omitempty"` // Artist image URL
+	ArtHash   string   `json:"ah,omitempty"` // Art hash for art requests
+}
+
+// SpotifyArtistListResponse represents a cursor-paginated artist list
+type SpotifyArtistListResponse struct {
+	Items      []SpotifyArtistItem `json:"it"`
+	Total      int                 `json:"tt"`
+	HasMore    bool                `json:"hm"`
+	NextCursor string              `json:"nc,omitempty"` // Cursor for next page (artists use cursor, not offset)
+	Timestamp  int64               `json:"t"`
+}
+
 // DequeueConnectionStatusRequest dequeues a connection status request from Redis
 func (s *Store) DequeueConnectionStatusRequest() (*ConnectionStatusRequest, error) {
 	data, err := s.client.BRPop(s.ctx, 1*time.Second, "system:connection_status_q").Result()
@@ -2099,5 +2119,21 @@ func (s *Store) StoreSpotifyPlaylistList(response *SpotifyPlaylistListResponse) 
 	}
 
 	log.Printf("[SPOTIFY] Stored playlist list: %d playlists (total: %d)", len(response.Items), response.Total)
+	return nil
+}
+
+// StoreSpotifyArtistList stores followed artists list in Redis
+func (s *Store) StoreSpotifyArtistList(response *SpotifyArtistListResponse) error {
+	data, err := json.Marshal(response)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Spotify artist list: %w", err)
+	}
+
+	err = s.client.Set(s.ctx, "spotify:library:artists", string(data), 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store Spotify artist list: %w", err)
+	}
+
+	log.Printf("[SPOTIFY] Stored artist list: %d artists (total: %d)", len(response.Items), response.Total)
 	return nil
 }

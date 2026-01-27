@@ -1359,7 +1359,8 @@ const (
 	SpotifyTrackListType             = 9  // SpotifyTrackListResponse (recent/liked tracks)
 	SpotifyAlbumListType             = 10 // SpotifyAlbumListResponse (saved albums)
 	SpotifyPlaylistListType          = 11 // SpotifyPlaylistListResponse (playlists)
-	MaxResponseType                  = 11 // Highest valid response type
+	SpotifyArtistListType            = 12 // SpotifyArtistListResponse (followed artists)
+	MaxResponseType                  = 12 // Highest valid response type
 )
 
 // State for each response type's chunk reassembly
@@ -1386,6 +1387,8 @@ var (
 	spotifyAlbumListTotalChunks   = 0
 	spotifyPlaylistListChunks     = make(map[int][]byte)
 	spotifyPlaylistListTotalChunks = 0
+	spotifyArtistListChunks        = make(map[int][]byte)
+	spotifyArtistListTotalChunks   = 0
 )
 
 func (c *Client) handlePodcastInfoNotification(buf []byte) {
@@ -1493,6 +1496,8 @@ func podcastResponseTypeName(t int) string {
 		return "spotify_album_list"
 	case SpotifyPlaylistListType:
 		return "spotify_playlist_list"
+	case SpotifyArtistListType:
+		return "spotify_artist_list"
 	default:
 		return "unknown"
 	}
@@ -1522,6 +1527,8 @@ func (c *Client) getPodcastChunkStorage(responseType int) (map[int][]byte, *int)
 		return spotifyAlbumListChunks, &spotifyAlbumListTotalChunks
 	case SpotifyPlaylistListType:
 		return spotifyPlaylistListChunks, &spotifyPlaylistListTotalChunks
+	case SpotifyArtistListType:
+		return spotifyArtistListChunks, &spotifyArtistListTotalChunks
 	default:
 		return podcastInfoChunks, &podcastInfoTotalChunks
 	}
@@ -1562,6 +1569,9 @@ func (c *Client) clearPodcastChunkStorage(responseType int) {
 	case SpotifyPlaylistListType:
 		spotifyPlaylistListChunks = make(map[int][]byte)
 		spotifyPlaylistListTotalChunks = 0
+	case SpotifyArtistListType:
+		spotifyArtistListChunks = make(map[int][]byte)
+		spotifyArtistListTotalChunks = 0
 	default:
 		podcastInfoChunks = make(map[int][]byte)
 		podcastInfoTotalChunks = 0
@@ -1593,6 +1603,8 @@ func (c *Client) processPodcastResponse(responseType int, data []byte) {
 		c.processSpotifyAlbumListJSON(data)
 	case SpotifyPlaylistListType:
 		c.processSpotifyPlaylistListJSON(data)
+	case SpotifyArtistListType:
+		c.processSpotifyArtistListJSON(data)
 	default:
 		// Legacy format - try multiple formats
 		c.processPodcastInfoJSON(data)
@@ -2021,6 +2033,61 @@ func (c *Client) processSpotifyPlaylistListJSON(data []byte) {
 	}
 
 	log.Printf("✅ Stored Spotify playlist list in Redis")
+}
+
+// processSpotifyArtistListJSON handles followed artists list
+func (c *Client) processSpotifyArtistListJSON(data []byte) {
+	log.Printf("👤 Processing Spotify artist list JSON (%d bytes)", len(data))
+
+	var response redis.SpotifyArtistListResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.Printf("❌ Failed to parse Spotify artist list: %v", err)
+		log.Printf("Raw JSON: %s", string(data))
+		c.trackError("spotify_artists_parse", err)
+		return
+	}
+
+	log.Printf("═══════════════════════════════════════════════════════")
+	log.Printf("👤 SPOTIFY ARTIST LIST: Received from Android")
+	log.Printf("   Artists: %d (total: %d, hasMore: %v, nextCursor: %s)",
+		len(response.Items), response.Total, response.HasMore, response.NextCursor)
+	for i, artist := range response.Items {
+		if i < 5 {
+			genreStr := ""
+			if len(artist.Genres) > 0 {
+				genreStr = " [" + artist.Genres[0] + "]"
+			}
+			log.Printf("   %d. %s (%d followers)%s",
+				i+1, artist.Name, artist.Followers, genreStr)
+		}
+	}
+	if len(response.Items) > 5 {
+		log.Printf("   ... and %d more", len(response.Items)-5)
+	}
+	log.Printf("═══════════════════════════════════════════════════════")
+
+	// Register artist art hashes for preview caching (like albums)
+	if c.albumHandler != nil {
+		libraryHashes := make([]string, 0, len(response.Items))
+		for _, artist := range response.Items {
+			if artist.ArtHash != "" {
+				libraryHashes = append(libraryHashes, artist.ArtHash)
+			}
+		}
+		if len(libraryHashes) > 0 {
+			c.albumHandler.RegisterLibraryHashes(libraryHashes)
+			log.Printf("📚 Registered %d artist art hashes for preview caching", len(libraryHashes))
+		}
+	}
+
+	// Store in Redis
+	if err := c.redisStore.StoreSpotifyArtistList(&response); err != nil {
+		log.Printf("❌ Failed to store Spotify artist list: %v", err)
+		c.trackError("spotify_artists_store", err)
+		return
+	}
+
+	log.Printf("✅ Stored Spotify artist list in Redis")
 }
 
 // processPodcastInfoJSON parses and stores podcast info JSON (legacy format)
@@ -2715,6 +2782,7 @@ func (c *Client) validatePlaybackCommand(cmd *redis.PlaybackCommand) error {
 		"library_liked":     true, // get liked/saved tracks
 		"library_albums":    true, // get saved albums
 		"library_playlists": true, // get user playlists
+		"library_artists":   true, // get followed artists
 		"play_uri":          true, // play a Spotify URI (track, album, playlist)
 	}
 
