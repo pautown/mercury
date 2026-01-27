@@ -22,16 +22,19 @@ type Store struct {
 
 // MediaState represents the media playback state
 type MediaState struct {
-	IsPlaying    bool   `json:"isPlaying"`
-	TrackTitle   string `json:"trackTitle"`
-	Artist       string `json:"artist"`
-	Album        string `json:"album"`
-	Duration     int64  `json:"duration"`
-	Position     int64  `json:"position"`
-	Volume       int    `json:"volume"`
-	Timestamp    int64  `json:"timestamp"`
-	AlbumArtHash string `json:"albumArtHash,omitempty"`
-	MediaChannel string `json:"mediaChannel,omitempty"` // App being controlled (e.g., "Spotify", "YouTube Music")
+	IsPlaying       bool   `json:"isPlaying"`
+	TrackTitle      string `json:"trackTitle"`
+	Artist          string `json:"artist"`
+	Album           string `json:"album"`
+	Duration        int64  `json:"duration"`
+	Position        int64  `json:"position"`
+	Volume          int    `json:"volume"`
+	Timestamp       int64  `json:"timestamp"`
+	AlbumArtHash    string `json:"albumArtHash,omitempty"`
+	MediaChannel    string `json:"mediaChannel,omitempty"`    // App being controlled (e.g., "Spotify", "YouTube Music")
+	SpotifyTrackId  string `json:"spotifyTrackId,omitempty"`  // Spotify track ID (for like/unlike, context menu)
+	SpotifyAlbumId  string `json:"spotifyAlbumId,omitempty"`  // Spotify album ID (for "Play Album" context action)
+	SpotifyArtistId string `json:"spotifyArtistId,omitempty"` // Spotify artist ID (for "Play Artist" context action)
 }
 
 // PlaybackCommand represents a playback control command
@@ -411,6 +414,17 @@ func (s *Store) StoreMediaState(state *MediaState) error {
 	// Store the controlled media channel (e.g., "Spotify", "YouTube Music")
 	if state.MediaChannel != "" {
 		pipe.Set(s.ctx, "media:controlled_channel", state.MediaChannel, 0)
+	}
+
+	// Store Spotify-specific IDs for context menu actions (Play Album, Play Artist)
+	if state.SpotifyTrackId != "" {
+		pipe.Set(s.ctx, "media:spotify_track_id", state.SpotifyTrackId, 0)
+	}
+	if state.SpotifyAlbumId != "" {
+		pipe.Set(s.ctx, "media:spotify_album_id", state.SpotifyAlbumId, 0)
+	}
+	if state.SpotifyArtistId != "" {
+		pipe.Set(s.ctx, "media:spotify_artist_id", state.SpotifyArtistId, 0)
 	}
 
 	_, err := pipe.Exec(s.ctx)
