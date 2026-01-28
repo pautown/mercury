@@ -249,46 +249,98 @@ check_binary() {
 
 # Deploy binary to remote device
 deploy_binary() {
-    log_info "Deploying $BINARY_NAME to $CARTHING_HOST:$REMOTE_BINARY_PATH"
-    
+    log_info "Deploying $BINARY_NAME to $CARTHING_HOST"
+
     if ! check_binary; then
         return 1
     fi
-    
+
     if ! test_ssh; then
         return 1
     fi
-    
+
+    # Mount filesystem as read-write
+    log_info "Mounting filesystem as read-write..."
+    if ! ssh_exec "mount -o remount,rw /"; then
+        log_warn "Failed to remount as rw (may already be rw)"
+    fi
+
+    # Stop mercury service before copying
+    log_info "Stopping mercury service..."
+    if ssh_exec "sv status mercury > /dev/null 2>&1"; then
+        if ! ssh_exec "sv stop mercury"; then
+            log_warn "Failed to stop mercury service (may not be running)"
+        else
+            log_success "Mercury service stopped"
+        fi
+    else
+        log_info "Mercury service not found or not running"
+    fi
+
     # Create target directory
     if ! ssh_exec "mkdir -p '$REMOTE_PATH'"; then
         log_error "Failed to create target directory: $REMOTE_PATH"
         return 1
     fi
-    
+
     # Backup existing binary if it exists
     if ssh_exec "test -f '$REMOTE_BINARY_PATH'"; then
         local backup_path="${REMOTE_BINARY_PATH}.backup"
         log_info "Creating backup: $backup_path"
         ssh_exec "cp '$REMOTE_BINARY_PATH' '$backup_path'" || log_warn "Backup creation failed"
     fi
-    
-    # Copy binary
+
+    # Copy binary to deploy path
     local binary_size=$(stat -c%s "$LOCAL_BINARY_PATH")
-    log_info "Transferring binary (${binary_size} bytes)..."
-    
+    log_info "Transferring binary to $REMOTE_BINARY_PATH (${binary_size} bytes)..."
+
     if ! scp_exec "$LOCAL_BINARY_PATH" "$REMOTE_BINARY_PATH"; then
-        log_error "Binary transfer failed"
+        log_error "Binary transfer to $REMOTE_BINARY_PATH failed"
         return 1
     fi
-    
+
     # Set executable permissions
     if ! ssh_exec "chmod +x '$REMOTE_BINARY_PATH'"; then
-        log_error "Failed to set executable permissions"
+        log_error "Failed to set executable permissions on $REMOTE_BINARY_PATH"
         return 1
     fi
-    
-    log_success "Binary deployed successfully"
-    
+
+    log_success "Binary deployed to $REMOTE_BINARY_PATH"
+
+    # Also copy to /usr/bin/mercury (the service binary location)
+    MERCURY_PATH="/usr/bin/mercury"
+    log_info "Copying binary to $MERCURY_PATH..."
+
+    if ssh_exec "test -f '$MERCURY_PATH'"; then
+        log_info "Creating backup of existing mercury binary..."
+        ssh_exec "cp '$MERCURY_PATH' '${MERCURY_PATH}.backup'" || log_warn "Mercury backup failed"
+    fi
+
+    if ! ssh_exec "cp '$REMOTE_BINARY_PATH' '$MERCURY_PATH'"; then
+        log_error "Failed to copy to $MERCURY_PATH"
+        return 1
+    fi
+
+    if ! ssh_exec "chmod +x '$MERCURY_PATH'"; then
+        log_error "Failed to set executable permissions on $MERCURY_PATH"
+        return 1
+    fi
+
+    log_success "Binary deployed to $MERCURY_PATH"
+
+    # Start mercury service
+    log_info "Starting mercury service..."
+    if ssh_exec "sv status mercury > /dev/null 2>&1"; then
+        if ! ssh_exec "sv start mercury"; then
+            log_error "Failed to start mercury service"
+            return 1
+        else
+            log_success "Mercury service started"
+        fi
+    else
+        log_warn "Mercury service not configured - skipping start"
+    fi
+
     # Test execution
     log_info "Testing binary execution..."
     if ssh_exec "'$REMOTE_BINARY_PATH' --help > /dev/null 2>&1 || echo 'Binary execution test completed'"; then
@@ -296,7 +348,7 @@ deploy_binary() {
     else
         log_warn "Binary execution test failed (may be normal if --help not implemented)"
     fi
-    
+
     return 0
 }
 
@@ -335,11 +387,31 @@ show_status() {
         local size=$(ssh_exec "stat -c%s '${PERSISTENT_PATH}/${BINARY_NAME}'" 2>/dev/null || echo "Unknown")
         echo "✅ Persistent Binary: ${PERSISTENT_PATH}/${BINARY_NAME} (${size} bytes)"
     else
-        echo "❌ Persistent Binary: Not found"  
+        echo "❌ Persistent Binary: Not found"
     fi
-    
+
+    # Check mercury binary
+    if ssh_exec "test -f '/usr/bin/mercury'"; then
+        local size=$(ssh_exec "stat -c%s '/usr/bin/mercury'" 2>/dev/null || echo "Unknown")
+        echo "✅ Mercury Binary: /usr/bin/mercury (${size} bytes)"
+    else
+        echo "❌ Mercury Binary: Not found"
+    fi
+
+    # Check mercury service status
+    local mercury_status=$(ssh_exec "sv status mercury 2>/dev/null" || echo "not configured")
+    if echo "$mercury_status" | grep -q "^run:"; then
+        echo "✅ Mercury Service: Running"
+        echo "   $mercury_status"
+    elif echo "$mercury_status" | grep -q "^down:"; then
+        echo "⚠️  Mercury Service: Stopped"
+        echo "   $mercury_status"
+    else
+        echo "❌ Mercury Service: $mercury_status"
+    fi
+
     # Check if process is running
-    if ssh_exec "pgrep -f '$BINARY_NAME' > /dev/null"; then
+    if ssh_exec "pgrep -f '$BINARY_NAME' > /dev/null || pgrep -f 'mercury' > /dev/null"; then
         echo "✅ Process Status: Running"
     else
         echo "❌ Process Status: Not running"

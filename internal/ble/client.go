@@ -576,7 +576,8 @@ func (c *Client) clientLoop(ctx context.Context) {
 func (c *Client) attemptConnection(ctx context.Context) error {
 	log.Printf("=== MediaDash BLE Client Connection Attempt ===")
 	log.Printf("Target Service UUID: %s", c.cfg.Ble.ServiceUUID)
-	log.Printf("Expected Device Names: MediaDash, MediaDash-Server, MediaDash-Companion")
+	log.Printf("Primary filter: advertised service UUID (works regardless of device name)")
+	log.Printf("Fallback: known device names (MediaDash, MediaDash-Server)")
 	log.Printf("Note: LLIZARD devices are from a different project and will be ignored")
 
 	// Parse service UUID
@@ -585,105 +586,105 @@ func (c *Client) attemptConnection(ctx context.Context) error {
 		return fmt.Errorf("invalid service UUID: %w", err)
 	}
 
-	// Start scanning
-	scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
+	// Rapid 2-second scan cycles until device found or context cancelled
 	var targetDevice *bluetooth.ScanResult
 	var discoveredDevices []bluetooth.ScanResult
+	scanCycle := 0
 
-	log.Println("Starting BLE scan for MediaDash devices...")
-
-	err = c.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		localName := result.LocalName()
-		address := result.Address.String()
-		rssi := result.RSSI
-
-		// Log every discovered device
-		log.Printf("Discovered BLE device: %s (%s) RSSI: %d", address, localName, rssi)
-
-		// Store device for potential service verification
-		discoveredDevices = append(discoveredDevices, result)
-
-		// Check if device advertises our service UUID in advertisement data
-		// Note: TinyGo Bluetooth may not expose Services() method directly
-		// We'll check for service UUIDs if the method is available, otherwise rely on name-based filtering
-		log.Printf("  Advertisement payload received")
-
-		// First try: Check advertisement data for service UUIDs (implementation-dependent)
-		// This is a best-effort check as not all BLE stacks expose this information
-		// TODO: If TinyGo bluetooth library adds Services() method support, enable this
-		/*
-			if advertServices, err := result.AdvertisementPayload.Services(); err == nil {
-				log.Printf("  Advertised services: %v", advertServices)
-				for _, advertUUID := range advertServices {
-					if advertUUID == serviceUUID {
-						log.Printf("  ✓ Found MediaDash service UUID in advertisement: %s", advertUUID.String())
-						targetDevice = &result
-						c.adapter.StopScan()
-						return
-					}
-				}
-			}
-		*/
-
-		// Second try: Check for known MediaDash device names
-		if localName == "MediaDash" || localName == "MediaDash-Server" {
-			log.Printf("  ✓ Found device with MediaDash name: %s", localName)
-			targetDevice = &result
-			c.adapter.StopScan()
-			return
-		}
-
-		// Third try: Check for potential Android/companion app names (including unnamed devices)
-		if localName == "Android" || localName == "NocturneCompanion" ||
-			localName == "MediaDash-Companion" || localName == "" {
-			log.Printf("  ? Found potential companion device: %s (will verify services)", localName)
-			// Don't stop scanning yet - continue looking for better matches
-			if targetDevice == nil {
-				targetDevice = &result
-			}
-		}
-
-		// Fourth try: For debugging - log rejection reason for LLIZARD devices
-		if localName == "LLIZARD" {
-			log.Printf("  ℹ Found LLIZARD device (different project) - Service UUID: %s vs expected %s",
-				"402cbeaa-4901-48ce-8278-42b358460c1e", serviceUUID.String())
-			log.Printf("  ℹ LLIZARD is from a different BLE project - skipping")
-		}
-
-		log.Printf("  - Device does not match MediaDash criteria")
-	})
-
-	if err != nil {
-		return fmt.Errorf("scan failed: %w", err)
-	}
-
-	// Wait for scan to complete or find device
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	log.Println("Starting rapid BLE scan cycles (2s windows) for MediaDash service...")
 
 	for {
+		// Check if outer context is cancelled before starting a new scan cycle
 		select {
-		case <-scanCtx.Done():
-			c.adapter.StopScan()
-			log.Printf("Scan completed. Found %d total devices", len(discoveredDevices))
+		case <-ctx.Done():
+			return fmt.Errorf("connection cancelled during scan")
+		default:
+		}
 
-			if targetDevice == nil {
-				// Try fallback: connect to any potential devices and verify services
-				targetDevice = c.tryFallbackDeviceSelection(discoveredDevices, serviceUUID)
+		scanCycle++
+		targetDevice = nil
+		discoveredDevices = discoveredDevices[:0]
+
+		if scanCycle <= 3 || scanCycle%10 == 0 {
+			log.Printf("Scan cycle %d: starting 2s scan window...", scanCycle)
+		}
+
+		scanCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+
+		err = c.adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
+			localName := result.LocalName()
+			address := result.Address.String()
+			rssi := result.RSSI
+
+			log.Printf("Discovered BLE device: %s (%s) RSSI: %d", address, localName, rssi)
+
+			// Skip known incompatible devices
+			if localName == "LLIZARD" {
+				log.Printf("  ℹ LLIZARD device (different project) - skipping")
+				return
+			}
+
+			discoveredDevices = append(discoveredDevices, result)
+
+			// Primary filter: check if device advertises the MediaDash service UUID
+			if result.HasServiceUUID(serviceUUID) {
+				log.Printf("  ✓ Found device advertising MediaDash service UUID: %s (%s)", address, localName)
+				targetDevice = &result
+				c.adapter.StopScan()
+				return
+			}
+
+			// Fallback: match by known device names (for devices that don't include service UUID in advertisement)
+			if localName == "MediaDash" || localName == "MediaDash-Server" {
+				log.Printf("  ? Found device with MediaDash name: %s (will verify services)", localName)
 				if targetDevice == nil {
-					return fmt.Errorf("no MediaDash device found within timeout (scanned %d devices)", len(discoveredDevices))
+					targetDevice = &result
 				}
 			}
+		})
+
+		if err != nil {
+			cancel()
+			return fmt.Errorf("scan failed: %w", err)
+		}
+
+		// Wait for scan window to complete or device to be found
+		ticker := time.NewTicker(100 * time.Millisecond)
+	scanWait:
+		for {
+			select {
+			case <-scanCtx.Done():
+				c.adapter.StopScan()
+				break scanWait
+			case <-ticker.C:
+				if targetDevice != nil {
+					c.adapter.StopScan()
+					break scanWait
+				}
+			}
+		}
+		ticker.Stop()
+		cancel()
+
+		// If we found a device, try fallback selection if needed, then break
+		if targetDevice != nil {
+			log.Printf("Scan cycle %d: found target device", scanCycle)
 			break
-		case <-ticker.C:
-			if targetDevice != nil {
+		}
+
+		// Try fallback device selection from this cycle's discoveries
+		if len(discoveredDevices) > 0 {
+			fallback := c.tryFallbackDeviceSelection(discoveredDevices, serviceUUID)
+			if fallback != nil {
+				targetDevice = fallback
+				log.Printf("Scan cycle %d: fallback device selected", scanCycle)
 				break
 			}
-			continue
 		}
-		break
+
+		if scanCycle <= 3 || scanCycle%10 == 0 {
+			log.Printf("Scan cycle %d: no device with MediaDash service found (%d devices seen), retrying...", scanCycle, len(discoveredDevices))
+		}
 	}
 
 	// Connect to device
@@ -786,11 +787,17 @@ func (c *Client) tryFallbackDeviceSelection(devices []bluetooth.ScanResult, targ
 			continue
 		}
 
-		// Only try devices that might be relevant (skip obvious non-matches)
-		if localName == "MediaDash" || localName == "MediaDash-Server" ||
-			localName == "Android" || localName == "NocturneCompanion" ||
-			localName == "MediaDash-Companion" || localName == "" {
-			log.Printf("  Adding potential device: %s (%s) RSSI: %d",
+		// Prefer devices that advertise the MediaDash service UUID
+		if device.HasServiceUUID(targetServiceUUID) {
+			log.Printf("  Adding device with MediaDash service UUID: %s (%s) RSSI: %d",
+				device.Address.String(), localName, device.RSSI)
+			potentialDevices = append(potentialDevices, device)
+			continue
+		}
+
+		// Fallback: try devices with known names
+		if localName == "MediaDash" || localName == "MediaDash-Server" {
+			log.Printf("  Adding potential device by name: %s (%s) RSSI: %d",
 				device.Address.String(), localName, device.RSSI)
 			potentialDevices = append(potentialDevices, device)
 		}
@@ -3491,23 +3498,10 @@ func (c *Client) scheduleReconnect() {
 
 	c.reconnectAttempts++
 
-	// Intelligent delay calculation based on error patterns
-	var delay time.Duration
-	if c.consecutiveErrors >= 3 {
-		// Multiple quick disconnects - likely ATT error pattern
-		delay = 30 * time.Second // Longer delay for ATT errors
-		log.Printf("Detected rapid disconnect pattern (%d consecutive), using extended delay", c.consecutiveErrors)
-	} else {
-		// Normal exponential backoff
-		delay = c.reconnectDelay * time.Duration(1<<uint(c.reconnectAttempts-1))
-		if delay > c.maxReconnectDelay {
-			delay = c.maxReconnectDelay
-		}
-	}
-
-	c.reconnectDelay = delay
-
-	log.Printf("Scheduling reconnection attempt %d in %v", c.reconnectAttempts, delay)
+	// Fixed 1-second delay before reconnect - attemptConnection handles
+	// continuous rapid scanning internally, so no backoff needed here
+	delay := 1 * time.Second
+	log.Printf("Scheduling reconnection attempt %d in %v (rapid scan will handle retries)", c.reconnectAttempts, delay)
 
 	go func() {
 		time.Sleep(delay)

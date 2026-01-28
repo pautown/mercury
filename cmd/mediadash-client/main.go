@@ -19,6 +19,14 @@ import (
 )
 
 func main() {
+	// Setup panic recovery to log crashes to persistent file
+	defer func() {
+		if r := recover(); r != nil {
+			ble.LogCrash(r)
+			log.Fatalf("FATAL: panic recovered: %v", r)
+		}
+	}()
+
 	// Parse command-line flags
 	debugLyrics := flag.Bool("debug-lyrics", false, "Enable verbose logging for lyrics operations")
 	flag.Parse()
